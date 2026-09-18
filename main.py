@@ -123,6 +123,7 @@ from PyQt5.QtWidgets import (
 import serial
 import serial.tools.list_ports
 from ssh_panel import SSHPanel
+from local_terminal import LocalTerminalPanel
 from network_panel import NetworkPanel
 from serial_terminal import SerialTerminalPanel
 
@@ -894,6 +895,8 @@ class DebugTool(QMainWindow):
         tab.addTab(self.serial_terminal, "串口终端")
         self.ssh_panel = SSHPanel(self.settings)
         tab.addTab(self.ssh_panel, "SSH（网络）")
+        self.local_terminal = LocalTerminalPanel()
+        tab.addTab(self.local_terminal, "本地终端")
         bv.addWidget(tab)
         right_split.addWidget(bottom)
         right_split.setStretchFactor(0, 3)
@@ -902,7 +905,7 @@ class DebugTool(QMainWindow):
 
         def resize_for_modbus(index):
             self.serial_terminal.output.responses_enabled = tab.widget(index) is self.serial_terminal
-            if tab.tabText(index) in ("Modbus", "串口终端", "SSH（网络）"):
+            if tab.tabText(index) in ("Modbus", "串口终端", "SSH（网络）", "本地终端"):
                 if not normal_split_sizes:
                     normal_split_sizes[:] = right_split.sizes()
                 right_split.setSizes([100, max(500, right_split.height() - 100)])
@@ -2454,6 +2457,13 @@ class DebugTool(QMainWindow):
 
     # -------------------------------------------------------------- #
     def closeEvent(self, ev):
+        if self.local_terminal.process is not None:
+            if not getattr(self, '_local_closing', False):
+                self._local_closing = True
+                self.local_terminal.stopped.connect(self.close)
+            self.local_terminal.stop()
+            ev.ignore()
+            return
         if self.ssh_panel.worker is not None:
             self.ssh_panel.worker.stop()
             if not getattr(self, '_ssh_closing', False):

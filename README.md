@@ -9,9 +9,9 @@
 - **协议**：MIT License
 
 ---
-![V1.0.1 深色主题 Modbus 夹爪配置界面](image.png)
+![V1.0.2 深色主题](/image/main.png)
 
-主图为 V1.0.1 实际界面：已导入夹爪 MBP，显示文件保存的 32 项寄存器数据，尚未连接设备。
+主图为 V1.0.2 实际界面。
 
 ## ✨ 功能特性
 
@@ -49,6 +49,13 @@ python3 main.py
 直接运行 `main.py` 时会自动使用项目 `.venv`（若存在），无需先激活环境；编辑器选择其他 Python 也可启动。Windows 安装依赖时使用 `.venv\Scripts\python.exe`。
 
 Linux 使用 Fcitx 时，若虚拟环境 Qt 缺少 Fcitx 插件，源码启动会优先选用已安装且兼容当前 Python 的系统 PyQt5，避免混用不同 Qt 补丁版本的输入法插件；其他依赖仍使用虚拟环境，不修改系统配置。
+
+### 本地终端
+
+在“本地终端”标签点击“启动本地终端”，以当前用户权限在用户主目录启动 `$SHELL`（不可用时使用 `/bin/sh`）。
+使用真实 PTY，支持 vi、Tab 补全、历史命令、Ctrl+C、中文输入及 Ctrl+Shift+C/V 复制粘贴，窗口尺寸自动同步。
+输入 `exit` 或点击“关闭本地终端”结束会话，可重新启动；关闭 DebugTool 时会关闭本地 shell 及前台任务。
+与串口、TCP/UDP、SSH 会话独立，目前支持 Linux/macOS，Windows 暂不支持。不记录本地终端输入到串口日志。
 
 ### 串口终端（USB / UART，无需 IP）
 
