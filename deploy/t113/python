@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+QT5COM_HOME=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+export QT5COM_HOME
+export PYTHONHOME="$QT5COM_HOME/runtime/usr"
+export PYTHONPATH="$QT5COM_HOME/runtime/usr/lib/python3/dist-packages:$QT5COM_HOME/app"
+export PYTHONDONTWRITEBYTECODE=1
+export LD_LIBRARY_PATH="$QT5COM_HOME/runtime/usr/lib/arm-linux-gnueabihf:$QT5COM_HOME/runtime/lib/arm-linux-gnueabihf${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export QT_PLUGIN_PATH="$QT5COM_HOME/runtime/usr/lib/arm-linux-gnueabihf/qt5/plugins"
+export QT_QPA_PLATFORM_PLUGIN_PATH="$QT_PLUGIN_PATH/platforms"
+export QT_QPA_FONTDIR="$QT5COM_HOME/runtime/usr/share/fonts/truetype"
+export FONTCONFIG_FILE="$QT5COM_HOME/fonts.conf"
+export XKB_CONFIG_ROOT="$QT5COM_HOME/runtime/usr/share/X11/xkb"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/qt5com}"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+exec "$PYTHONHOME/bin/python3.8" "$@"

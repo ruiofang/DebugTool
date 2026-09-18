@@ -1,0 +1,12 @@
+/build
+/dist
+*.old
+*.spec
+*.log
+SerialDebugTool-V1.0-linux.spec
+/__pycache__
+**/__pycache__/
+serial_tool.ini
+/.venv/
+/tests/
+ssh_known_hosts

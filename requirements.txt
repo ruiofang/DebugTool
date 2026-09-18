@@ -1,0 +1,4 @@
+PyQt5>=5.15
+pyserial>=3.5
+paramiko>=2.9.3
+pyte>=0.8.2,<0.9

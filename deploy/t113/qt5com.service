@@ -1,0 +1,17 @@
+[Unit]
+Description=DebugTool serial, SSH, TCP and UDP debugger on T113 framebuffer
+After=local-fs.target
+RequiresMountsFor=/mnt/UDISK/qt5com
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/UDISK/qt5com/app
+ExecStart=/mnt/UDISK/qt5com/bin/qt5com
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
