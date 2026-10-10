@@ -87,25 +87,38 @@ class CanConfigurationTests(unittest.TestCase):
             run.return_value = json.dumps([link])
             self.assertEqual(config.read_link('/bin/ip', 'can_qa'), link)
 
-    def test_capability_check_uses_effective_bit_not_root_uid(self):
-        with patch('can_config.Path.read_text', return_value='Name: test\nCapEff:\t0000000000001000\n'):
-            self.assertTrue(config.has_net_admin())
-        with patch('can_config.Path.read_text', return_value='CapEff:\t0000000000000000\n'):
-            self.assertFalse(config.has_net_admin())
-
-    def test_no_capability_never_mutates_link(self):
+    def test_successful_ip_configuration_needs_no_helper_capability(self):
         with patch('can_config.find_ip', return_value='/bin/ip'), \
                 patch('can_config.read_link', return_value=physical_link()), \
-                patch('can_config.has_net_admin', return_value=False), \
-                patch('can_config._run_ip') as run:
+                patch('can_config.Path.read_text', return_value='CapEff:\t0000000000000000\n'), \
+                patch('can_config.subprocess.run', return_value=Mock(returncode=0, stdout='')) as run:
+            self.assertIn('已配置并启用', config.configure('can_qa', 500000))
+            self.assertEqual([call.args[0] for call in run.call_args_list], [
+                ['/bin/ip', 'link', 'set', 'dev', 'can_qa', 'type', 'can', 'bitrate', '500000'],
+                ['/bin/ip', 'link', 'set', 'dev', 'can_qa', 'up']])
+
+    def test_ip_permission_denial_requests_authorization(self):
+        denied = Mock(returncode=2, stdout='', stderr='RTNETLINK answers: Operation not permitted')
+        with patch('can_config.find_ip', return_value='/bin/ip'), \
+                patch('can_config.read_link', return_value=physical_link()), \
+                patch('can_config.subprocess.run', return_value=denied) as run:
             with self.assertRaises(config.AuthorizationRequired):
                 config.configure('can_qa', 500000)
-            run.assert_not_called()
+            self.assertEqual(run.call_count, 1)
+
+    def test_ip_driver_error_does_not_request_authorization(self):
+        rejected = Mock(returncode=2, stdout='', stderr='RTNETLINK answers: Invalid argument')
+        with patch('can_config.find_ip', return_value='/bin/ip'), \
+                patch('can_config.read_link', return_value=physical_link()), \
+                patch('can_config.subprocess.run', return_value=rejected) as run:
+            with self.assertRaisesRegex(config.ConfigError, 'Invalid argument') as error:
+                config.configure('can_qa', 500000)
+            self.assertNotIsInstance(error.exception, config.AuthorizationRequired)
+            self.assertEqual(run.call_count, 1)
 
     def test_matching_link_needs_no_capability(self):
         with patch('can_config.find_ip', return_value='/bin/ip'), \
                 patch('can_config.read_link', return_value=physical_link(True, 500000)), \
-                patch('can_config.has_net_admin', return_value=False), \
                 patch('can_config._run_ip') as run:
             self.assertIn('一致', config.configure('can_qa', 500000))
             run.assert_not_called()
@@ -113,10 +126,33 @@ class CanConfigurationTests(unittest.TestCase):
     def test_partial_failure_is_explicit_and_does_not_continue_up(self):
         with patch('can_config.find_ip', return_value='/bin/ip'), \
                 patch('can_config.read_link', return_value=physical_link(True, 125000)), \
-                patch('can_config.has_net_admin', return_value=True), \
                 patch('can_config._run_ip', side_effect=['', config.ConfigError('bad bitrate')]) as run:
             with self.assertRaisesRegex(config.ConfigError, '接口配置未完成'):
                 config.configure('can_qa', 500000)
+            self.assertEqual(run.call_count, 2)
+
+    def test_partial_permission_failure_preserves_authorization_and_stops_before_up(self):
+        success = Mock(returncode=0, stdout='', stderr='')
+        denied = Mock(returncode=2, stdout='', stderr='RTNETLINK answers: Operation not permitted')
+        with patch('can_config.find_ip', return_value='/bin/ip'), \
+                patch('can_config.read_link', return_value=physical_link(True, 125000)), \
+                patch('can_config.subprocess.run', side_effect=[success, denied]) as run:
+            with self.assertRaisesRegex(config.AuthorizationRequired, '接口配置未完成'):
+                config.configure('can_qa', 500000)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args_list[0].args[0][-1], 'down')
+            self.assertEqual(run.call_args_list[1].args[0][-2:], ['bitrate', '500000'])
+
+    def test_partial_permission_failure_returns_auth_required_exit_code(self):
+        success = Mock(returncode=0, stdout='', stderr='')
+        denied = Mock(returncode=2, stdout='', stderr='RTNETLINK answers: Permission denied')
+        with patch.dict('can_config.os.environ'), \
+                patch('sys.stdout', new_callable=io.StringIO) as output, \
+                patch('can_config.find_ip', return_value='/bin/ip'), \
+                patch('can_config.read_link', return_value=physical_link(True, 125000)), \
+                patch('can_config.subprocess.run', side_effect=[success, denied]) as run:
+            self.assertEqual(config.main(['--interface', 'can_qa', '--bitrate', '500000']), 77)
+            self.assertIn('接口配置未完成', output.getvalue())
             self.assertEqual(run.call_count, 2)
 
     def test_system_command_has_fixed_argv_timeout_and_no_shell(self):
@@ -159,19 +195,36 @@ class CanDisableTests(unittest.TestCase):
 
     def test_down_interface_is_idempotent_and_needs_no_privilege(self):
         with patch('can_config.read_link', return_value=physical_link()), \
-                patch('can_config.has_net_admin') as capability, \
                 patch('can_config._run_ip') as run:
             self.assertIn('已处于 DOWN', config.disable('can_qa'))
-            capability.assert_not_called()
             run.assert_not_called()
 
-    def test_up_interface_needs_authorization_before_any_mutation(self):
+    def test_successful_ip_disable_needs_no_helper_capability(self):
+        with patch('can_config.read_link', side_effect=[physical_link(True, 500000), physical_link()]), \
+                patch('can_config.Path.read_text', return_value='CapEff:\t0000000000000000\n'), \
+                patch('can_config.subprocess.run', return_value=Mock(returncode=0, stdout='')) as run:
+            self.assertIn('已停用（DOWN）', config.disable('can_qa'))
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0],
+                             ['/bin/ip', 'link', 'set', 'dev', 'can_qa', 'down'])
+
+    def test_up_interface_requests_authorization_only_after_ip_denial(self):
+        denied = Mock(returncode=2, stdout='', stderr='RTNETLINK answers: Operation not permitted')
         with patch('can_config.read_link', return_value=physical_link(True, 500000)), \
-                patch('can_config.has_net_admin', return_value=False), \
-                patch('can_config._run_ip') as run:
+                patch('can_config.subprocess.run', return_value=denied) as run:
             with self.assertRaisesRegex(config.AuthorizationRequired, '停用'):
                 config.disable('can_qa')
-            run.assert_not_called()
+            self.assertEqual(run.call_count, 1)
+
+    def test_down_driver_error_does_not_request_authorization(self):
+        rejected = Mock(returncode=2, stdout='', stderr='RTNETLINK answers: Device or resource busy')
+        with patch('can_config.read_link', return_value=physical_link(True, 500000)) as read, \
+                patch('can_config.subprocess.run', return_value=rejected) as run:
+            with self.assertRaisesRegex(config.ConfigError, 'resource busy') as error:
+                config.disable('can_qa')
+            self.assertNotIsInstance(error.exception, config.AuthorizationRequired)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(read.call_count, 1)
 
     def test_success_mutates_only_selected_interface_then_checks_down(self):
         for kind in ('can', 'vcan', 'vxcan'):
@@ -179,7 +232,6 @@ class CanDisableTests(unittest.TestCase):
             up['linkinfo']['info_kind'] = down['linkinfo']['info_kind'] = kind
             with self.subTest(kind=kind), \
                     patch('can_config.read_link', side_effect=[up, down]) as read, \
-                    patch('can_config.has_net_admin', return_value=True), \
                     patch('can_config._run_ip') as run:
                 self.assertIn('已停用（DOWN）', config.disable('can_qa'))
                 self.assertEqual(read.call_count, 2)
@@ -190,7 +242,6 @@ class CanDisableTests(unittest.TestCase):
 
     def test_command_success_is_not_accepted_if_interface_is_still_up(self):
         with patch('can_config.read_link', return_value=physical_link(True, 500000)), \
-                patch('can_config.has_net_admin', return_value=True), \
                 patch('can_config._run_ip'):
             with self.assertRaisesRegex(config.ConfigError, '仍处于 UP'):
                 config.disable('can_qa')
@@ -198,22 +249,19 @@ class CanDisableTests(unittest.TestCase):
     def test_unreadable_state_after_down_is_not_reported_as_success(self):
         with patch('can_config.read_link', side_effect=[physical_link(True, 500000),
                                                        config.ConfigError('disconnected')]), \
-                patch('can_config.has_net_admin', return_value=True), \
                 patch('can_config._run_ip'):
             with self.assertRaisesRegex(config.ConfigError, '无法确认 DOWN'):
                 config.disable('can_qa')
 
     def test_failed_down_command_is_reported_without_claiming_success(self):
         with patch('can_config.read_link', return_value=physical_link(True, 500000)) as read, \
-                patch('can_config.has_net_admin', return_value=True), \
                 patch('can_config._run_ip', side_effect=config.ConfigError('busy')):
             with self.assertRaisesRegex(config.ConfigError, '停用 can_qa 失败.*busy'):
                 config.disable('can_qa')
             self.assertEqual(read.call_count, 1)
 
-    def test_down_permission_race_remains_authorization_failure(self):
+    def test_down_permission_failure_preserves_operation_context(self):
         with patch('can_config.read_link', return_value=physical_link(True, 500000)), \
-                patch('can_config.has_net_admin', return_value=True), \
                 patch('can_config._run_ip', side_effect=config.AuthorizationRequired('denied')):
             with self.assertRaisesRegex(config.AuthorizationRequired, '停用'):
                 config.disable('can_qa')

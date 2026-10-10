@@ -74,7 +74,9 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s qa -v
 
 例如设备为 **500 kbit/s**，选择 `can0`、仲裁比特率 `500000` 后点击“打开”。CAN FD 还需要适配器与其他节点支持，并设置对应的数据比特率。已存在的虚拟 `vcan` 接口会自动启用，不配置比特率。程序不创建不存在的接口，USB-CAN 仍需系统驱动识别。
 
-自动配置使用系统 `ip` 工具和 `pkexec`；普通桌面会通过 polkit 认证窗口申请权限，主界面仍以普通用户运行。未安装相关工具、没有桌面认证代理、取消认证或驱动不支持选定参数时，界面会显示失败原因。认证和配置在独立进程完成，可取消打开；取消或退出后不会再自动连接，已经授权执行的系统配置可能仍会完成。“高级…”保留系统命令供排查使用。详细配置见 [Linux 内核 SocketCAN 文档](https://docs.kernel.org/networking/can.html#how-to-use-socketcan) 和 [polkit 认证说明](https://polkit.pages.freedesktop.org/polkit/pkexec.1.html)。
+自动配置先以当前用户直接调用系统 `ip` 工具，只有实际操作返回权限拒绝才通过 `pkexec` / polkit 申请授权。运行新版 `install.sh` 后，程序会使用已安装的专用 CAN 助手，本机当前活动桌面用户默认免密配置比特率及 UP/DOWN，主界面仍以普通用户运行。未安装助手时保留原有管理员认证流程；SSH、非活动会话或系统管理员覆盖默认策略时仍可能要求认证。认证和配置在独立进程完成，可取消打开；取消或退出后不会再自动连接，已经授权执行的系统配置可能仍会完成。“高级…”保留系统命令供排查使用。详细配置见 [Linux 内核 SocketCAN 文档](https://docs.kernel.org/networking/can.html#how-to-use-socketcan) 和 [polkit 认证说明](https://polkit.pages.freedesktop.org/polkit/pkexec.1.html)。
+
+**设备访问权限与接口配置权限不同**：修改 USB 设备节点权限或加入设备用户组，不会自动授予设置 CAN 比特率、执行 UP/DOWN 所需的 [`CAP_NET_ADMIN`](https://man7.org/linux/man-pages/man7/capabilities.7.html)。`install.sh` 通过专属 polkit action 授权受限的 CAN 助手，只允许操作已存在的 CAN / vcan / vxcan 接口；不修改用户组、sudoers，也不为通用 `ip`、Python 或 GUI 程序添加免密权限。日常启动程序不会修改系统授权。
 
 点击 CAN 的 **关闭** 会先停止收发、释放 socket，再自动将对应接口设为 **DOWN**，需要权限时弹出系统认证窗口。只有检查到接口确实 DOWN 后才显示停用成功；取消认证或停用失败会显示原因，并可点击“重试停用”再次执行。再次点击“打开”会按所选参数重新启用接口。停用接口或修改比特率会影响同一接口上的其他程序。切换通信模式、退出程序或遇到收发错误时，仅释放本程序的连接，不主动停用系统接口。
 
@@ -246,12 +248,21 @@ python3 build.py --clean             # 清理构建产物，保留 VERSION
 - Linux / Windows 均输出 `--onefile` 单文件，双击即可运行。
 
 ### 安装到系统（Linux）
+
 ```bash
-sudo ./install.sh                 # 安装到 /opt/qt5com，创建桌面快捷方式
-sudo ./install.sh --uninstall     # 卸载
+sudo ./install.sh                 # 安装程序、桌面入口和默认 CAN 免密授权
+sudo ./install.sh --uninstall     # 卸载主程序和用户配置，保留 CAN 助手及授权
 ```
-默认安装 `VERSION` 对应的 Linux 产物，尚未打包该版本时会明确报错。也可用 `sudo ./install.sh /path/to/DebugTool` 指定已有程序；只分发安装脚本和产物、没有 `VERSION` 时按版本号选择最新产物。
+默认安装 `VERSION` 对应的 Linux 产物，尚未打包该版本时会明确报错。也可用 `sudo ./install.sh /path/to/DebugTool` 指定已有程序；没有 `VERSION` 时按版本号选择最新产物。使用新 CAN 授权入口需要先用更新后的源码重新打包，再安装。
+
+安装器需要系统 Python 3.7+（固定 `/usr/bin/python3`）、`iproute2`、polkit / `pkexec`。专用助手只使用 Python 标准库；缺少依赖或安装路径权限不安全时，会在修改已安装程序前明确报错。分发安装包时须附带 `install.sh`、同目录的 `can_config.py` 和可执行产物；安装过程不会启停真实 CAN 接口。
+
+CAN 助手独立安装到 `/usr/local/libexec/debugtool/`，其中 `can-config` 为固定入口，`can_config.py` 负责参数和接口校验；专属策略为 `/usr/share/polkit-1/actions/org.ruio.debugtool.configure-can.policy`。这些文件及目录由 root 管理，普通用户不可写，助手以隔离的系统 Python 运行。本机当前活动桌面会话默认免密，其他会话保留管理员认证，具体范围遵循 [polkit 会话授权规则](https://polkit.pages.freedesktop.org/polkit/polkit.8.html)。重复安装会更新助手和策略。
+
+**卸载主程序会保留上述 CAN 助手和授权策略**，助手不依赖 `/opt/qt5com`，下次安装可继续使用。
+
 安装后：
+
 - 终端命令：`DebugTool`（保留 `qt5com` 兼容命令）
 - 应用菜单：`DebugTool`
 - 桌面图标：`/usr/share/pixmaps/qt5com.png`
@@ -301,6 +312,7 @@ python3 gen_icon.py           # 重新生成 app.png / app.ico
 - 新增 Windows PCAN 和 candleLight（gs_usb）驱动选项；PCAN FD 需对应硬件，candleLight 当前支持经典 CAN / RTR。
 - CAN 驱动在后台执行枚举和收发，发送成功后才计数、记录日志；关闭或切换模式时保留已接收及已确认发送的尾部帧。
 - 统一使用 `VERSION` 管理版本号，支持打包时一次设置，并自动覆盖生成 `version_info.txt`，同步程序版本、产物名称和 Windows 文件属性。
+- Linux 安装时默认配置受限的 CAN 免密助手，本机活动桌面用户可直接配置接口；卸载主程序保留助手和授权策略。
 
 ### V1.0.2
 

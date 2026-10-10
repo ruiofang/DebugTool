@@ -110,17 +110,6 @@ def read_link(ip, interface):
         raise ConfigError('无法解析 CAN 接口状态，请检查系统 iproute2 版本') from exc
 
 
-def has_net_admin():
-    """Test the effective capability, including inside user/network namespaces."""
-    try:
-        for line in Path('/proc/self/status').read_text().splitlines():
-            if line.startswith('CapEff:'):
-                return bool(int(line.split()[1], 16) & (1 << 12))
-    except (OSError, ValueError, IndexError):
-        pass
-    return False
-
-
 def configuration_commands(link, interface, bitrate, fd, data_bitrate):
     """Return the minimal link changes. An already matching UP link is untouched."""
     info = link.get('linkinfo', {})
@@ -161,8 +150,8 @@ def configure(interface, bitrate, fd=False, data_bitrate=2_000_000):
     commands = configuration_commands(link, interface, bitrate, fd, data_bitrate)
     if not commands:
         return f'{interface} 已启用，配置与所选参数一致'
-    if not has_net_admin():
-        raise AuthorizationRequired('配置 CAN 比特率并启用接口需要系统管理员授权')
+    # The ip executable may have permissions that this Python helper does not.
+    # Let the real operation decide; only EPERM/EACCES requests authorization.
     changed = False
     try:
         for command in commands:
@@ -170,7 +159,8 @@ def configure(interface, bitrate, fd=False, data_bitrate=2_000_000):
             changed = True
     except ConfigError as exc:
         if changed:
-            raise ConfigError(f'{exc}；接口配置未完成，请检查状态后重试') from exc
+            error_type = AuthorizationRequired if isinstance(exc, AuthorizationRequired) else ConfigError
+            raise error_type(f'{exc}；接口配置未完成，请检查状态后重试') from exc
         raise
     return f'{interface} 已配置并启用'
 
@@ -186,8 +176,6 @@ def disable(interface):
         raise ConfigError(f'{interface} 不是支持停用的 SocketCAN 接口')
     if 'UP' not in link['flags']:
         return f'{interface} 已处于 DOWN 状态'
-    if not has_net_admin():
-        raise AuthorizationRequired('停用 CAN 接口需要系统管理员授权')
     try:
         _run_ip(ip, ['link', 'set', 'dev', interface, 'down'], mutation=True)
     except AuthorizationRequired as exc:

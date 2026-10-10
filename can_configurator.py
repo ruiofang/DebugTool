@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import stat
 import sys
 
 from PyQt5.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyqtSignal
@@ -14,9 +15,12 @@ from can_config import (AUTH_REQUIRED, ConfigError, system_environment,
 
 _LIVE_JOBS = set()
 PKEXEC_PATHS = ('/usr/bin/pkexec', '/bin/pkexec')
+INSTALLED_HELPER = Path('/usr/local/libexec/debugtool/can-config')
+INSTALLED_SOURCE = INSTALLED_HELPER.with_name('can_config.py')
+INSTALLED_POLICY = Path('/usr/share/polkit-1/actions/org.ruio.debugtool.configure-can.policy')
 
 
-def helper_command(interface, bitrate=None, fd=False, data_bitrate=2_000_000, *, down=False):
+def _request_arguments(interface, bitrate=None, fd=False, data_bitrate=2_000_000, *, down=False):
     args = ['--interface', interface]
     if down:
         args.append('--down')
@@ -24,11 +28,44 @@ def helper_command(interface, bitrate=None, fd=False, data_bitrate=2_000_000, *,
         args += ['--bitrate', str(bitrate), '--data-bitrate', str(data_bitrate)]
         if fd:
             args.append('--fd')
+    return args
+
+
+def helper_command(interface, bitrate=None, fd=False, data_bitrate=2_000_000, *, down=False):
+    args = _request_arguments(interface, bitrate, fd, data_bitrate, down=down)
     executable = str(Path(sys.executable).absolute())
     if getattr(sys, 'frozen', False):
         return executable, ['--configure-can', *args]
     # -I ignores PYTHONPATH, user site packages and the working directory.
     return executable, ['-I', str(Path(__file__).with_name('can_config.py').resolve()), *args]
+
+
+def _trusted_install_path(path, *, executable=False):
+    """Reject writable, redirected or non-root-owned privilege entry points."""
+    path = Path(path)
+    if not path.is_absolute():
+        return False
+    try:
+        # lstat deliberately rejects symlinks, including ancestor directories.
+        # Checking ancestors prevents replacing an otherwise root-owned file.
+        for entry in (*reversed(path.parents), path):
+            info = entry.lstat()
+            expected_type = stat.S_ISREG if entry == path else stat.S_ISDIR
+            if (not expected_type(info.st_mode) or info.st_uid != 0
+                    or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+                return False
+        return not executable or os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
+def find_installed_helper():
+    """Use only the dedicated helper installed together with its polkit policy."""
+    if (_trusted_install_path(INSTALLED_HELPER, executable=True)
+            and _trusted_install_path(INSTALLED_SOURCE)
+            and _trusted_install_path(INSTALLED_POLICY)):
+        return str(INSTALLED_HELPER)
+    return None
 
 
 def find_pkexec():
@@ -180,6 +217,12 @@ class CanConfigurator(QObject):
                 self._request = None
                 self.finished.emit(False, f'自动{self._operation}需要系统 pkexec；请安装 polkit 后重试')
                 return
+            installed = find_installed_helper()
+            if installed:
+                executable = installed
+                # The installed entry point accepts only CAN arguments. Never
+                # pass interpreter/frozen-GUI flags to its polkit authorization.
+                args = _request_arguments(*self._request, down=self._down)
             args = ['--disable-internal-agent', executable, *args]
             executable = pkexec
         self._job = _ProcessJob(executable, args, elevated, self._request[0])
@@ -193,7 +236,7 @@ class CanConfigurator(QObject):
             return
         self._job = None
         if code == AUTH_REQUIRED and not job.elevated:
-            self.progress.emit(f'请在系统认证窗口授权{self._operation} CAN 接口…')
+            self.progress.emit(f'正在申请 CAN 接口{self._operation}授权…')
             self._launch(True)
             return
         self._request = None
