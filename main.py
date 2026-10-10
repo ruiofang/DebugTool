@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 DebugTool (PyQt5)
-Version: V1.0.2
+Version: defined in VERSION
 Author : RUIO
 License: MIT
 Features:
@@ -17,9 +17,6 @@ Features:
 
 from __future__ import annotations
 
-__version__ = "V1.0.2"
-__author__ = "RUIO"
-
 import os
 import sys
 import json
@@ -27,7 +24,16 @@ import time
 import datetime
 import struct
 import re
+import threading
+from collections import deque
 from pathlib import Path
+
+
+# The authenticated CAN helper needs no Qt, settings, or application window.
+# Keep this before source-venv relaunch and GUI imports for frozen builds too.
+if __name__ == "__main__" and sys.argv[1:2] == ["--configure-can"]:
+    from can_config import main as configure_can_main
+    raise SystemExit(configure_can_main(sys.argv[2:]))
 
 
 # Direct source launches use the project's installed environment, including
@@ -38,6 +44,12 @@ if __name__ == "__main__" and not getattr(sys, "frozen", False):
     if _project_python.is_file() and Path(sys.prefix).resolve() != _project_venv.resolve():
         os.execv(str(_project_python),
                  [str(_project_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+from app_meta import APP_NAME, AUTHOR, read_version
+
+__version__ = read_version()
+__author__ = AUTHOR
 
 
 def app_dir() -> str:
@@ -126,6 +138,8 @@ from ssh_panel import SSHPanel
 from local_terminal import LocalTerminalPanel
 from network_panel import NetworkPanel
 from serial_terminal import SerialTerminalPanel
+from async_log import AsyncLogWriter
+from can_panel import CanPanel
 
 
 # ------------------------------------------------------------------ #
@@ -238,7 +252,7 @@ def hex_str_to_bytes(text: str) -> bytes:
 
 
 def bytes_to_hex_str(data: bytes) -> str:
-    return " ".join(f"{b:02X}" for b in data)
+    return data.hex(" ").upper()
 
 
 def now_ms() -> str:
@@ -551,15 +565,55 @@ def parse_binary_mbp_profile(data: bytes) -> dict | None:
 #  串口读取线程
 # ------------------------------------------------------------------ #
 class SerialReader(QThread):
-    data_received = pyqtSignal(bytes)
     error = pyqtSignal(str)
     FLUSH_INTERVAL = 0.020
     MAX_CHUNK_BYTES = 4096
+    MAX_PENDING_BYTES = 1024 * 1024
 
     def __init__(self, ser: serial.Serial, parent=None):
         super().__init__(parent)
         self.ser = ser
         self._running = True
+        self.log_writer = None
+        self.hex_mode = False
+        self._lock = threading.Lock()
+        self._pending = deque()
+        self._pending_bytes = 0
+        self._received_bytes = 0
+        self._dropped_bytes = 0
+
+    def _publish(self, data):
+        # Log before applying the UI limit. No Qt event is posted per packet:
+        # the GUI pulls a bounded batch on its own timer.
+        writer = self.log_writer
+        if writer is not None:
+            writer.write_received(data, self.hex_mode)
+        with self._lock:
+            self._received_bytes += len(data)
+            self._pending.append(data)
+            self._pending_bytes += len(data)
+            while self._pending_bytes > self.MAX_PENDING_BYTES:
+                first = self._pending.popleft()
+                removed = min(len(first), self._pending_bytes - self.MAX_PENDING_BYTES)
+                if removed < len(first):
+                    self._pending.appendleft(first[removed:])
+                self._pending_bytes -= removed
+                self._dropped_bytes += removed
+
+    def take_received(self, max_bytes):
+        chunks = []
+        with self._lock:
+            while self._pending and max_bytes > 0:
+                chunk = self._pending.popleft()
+                if len(chunk) > max_bytes:
+                    self._pending.appendleft(chunk[max_bytes:])
+                    chunk = chunk[:max_bytes]
+                chunks.append(chunk)
+                self._pending_bytes -= len(chunk)
+                max_bytes -= len(chunk)
+            received, dropped = self._received_bytes, self._dropped_bytes
+            self._received_bytes = self._dropped_bytes = 0
+        return chunks, received, dropped
 
     def run(self):
         buf = bytearray()
@@ -574,7 +628,7 @@ class SerialReader(QThread):
                 now = time.monotonic()
                 if buf and (len(buf) >= self.MAX_CHUNK_BYTES or
                             now - last_flush >= self.FLUSH_INTERVAL):
-                    self.data_received.emit(bytes(buf))
+                    self._publish(bytes(buf))
                     buf.clear()
                     last_flush = now
                 if not n:
@@ -583,7 +637,7 @@ class SerialReader(QThread):
                 self.error.emit(str(e))
                 break
         if buf:
-            self.data_received.emit(bytes(buf))
+            self._publish(bytes(buf))
 
     def stop(self):
         self._running = False
@@ -594,6 +648,7 @@ class SerialReader(QThread):
 #  主窗口
 # ------------------------------------------------------------------ #
 class DebugTool(QMainWindow):
+    CAN_MODE = 4
     COMMON_BAUDS = ["1200", "2400", "4800", "9600", "19200", "38400",
                     "57600", "115200", "230400", "460800", "921600"]
     DATA_BITS = ["8", "7", "6", "5"]
@@ -612,6 +667,8 @@ class DebugTool(QMainWindow):
     MAX_HISTORY = 30
     MAX_DISPLAY_BLOCKS = 2000
     MAX_DISPLAY_CHARS = 512 * 1024
+    MAX_DISPLAY_LINE_CHARS = 1024
+    SERIAL_UI_BATCH_BYTES = 32 * 1024
 
     def __init__(self):
         super().__init__()
@@ -625,8 +682,10 @@ class DebugTool(QMainWindow):
         self.ser: serial.Serial | None = None
         self.reader: SerialReader | None = None
         self.log_file = None
+        self._reported_log_error = None
         self.tx_bytes = 0
         self.rx_bytes = 0
+        self.rx_display_dropped = 0
         self.pending_modbus_request = None
         self.modbus_rx_buffer = bytearray()
         self.modbus_entries = []
@@ -646,13 +705,21 @@ class DebugTool(QMainWindow):
         self._apply_style()
         self._load_settings()
 
+        self.serial_receive_timer = QTimer(self)
+        self.serial_receive_timer.setInterval(20)
+        self.serial_receive_timer.timeout.connect(self._drain_serial_data)
+        self.chk_rx_hex.toggled.connect(self._set_serial_hex_mode)
+        self.log_error_timer = QTimer(self)
+        self.log_error_timer.setInterval(250)
+        self.log_error_timer.timeout.connect(self._check_log_error)
+
         # 启动时刷新一次，之后仅手动刷新
         self.refresh_ports()
 
         # 自动发送定时器
         self.auto_send_timer = QTimer(self)
         self.auto_send_timer.timeout.connect(self.on_send_clicked)
-        self.transport_mode.setCurrentIndex(max(0, min(3, self.settings.value('transport_mode', 0, type=int))))
+        self.transport_mode.setCurrentIndex(max(0, min(self.CAN_MODE, self.settings.value('transport_mode', 0, type=int))))
         self._on_transport_changed(self.transport_mode.currentIndex())
 
     # -------------------------------------------------------------- #
@@ -661,6 +728,7 @@ class DebugTool(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
+        self.can_panel = CanPanel(self.settings)
 
         # ============ 左侧：串口配置 ============
         cfg_box = QGroupBox("串口配置")
@@ -735,11 +803,14 @@ class DebugTool(QMainWindow):
         # ============ 发送区 ============
         send_box = QGroupBox("发送")
         sv = QVBoxLayout(send_box)
+        sv.addWidget(self.can_panel.send_options)
+        self.can_panel.send_options.hide()
 
         # ---- 第 1 行：多行输入框（上移、加高） ----
         self.send_edit = QPlainTextEdit()
         self.send_edit.setPlaceholderText(
             "在此输入待发送内容（支持多行）…\nHEX 模式下请输入十六进制，如：AA 55 01 02")
+        self._default_send_placeholder = self.send_edit.placeholderText()
         self.send_edit.setMinimumHeight(140)
         sv.addWidget(self.send_edit, 1)
 
@@ -853,7 +924,7 @@ class DebugTool(QMainWindow):
         self.recv_edit.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.recv_edit.setUndoRedoEnabled(False)
         self.recv_edit.setMaximumBlockCount(self.MAX_DISPLAY_BLOCKS)
-        self.recv_edit.setToolTip("显示最近 2000 行，最多 512K 字符；完整数据请启用日志保存。")
+        self.recv_edit.setToolTip("显示最近 2000 行，最多 512K 字符；长行分段显示。完整数据请启用日志保存。")
 
         # ============ 总体布局 ============
         left = QWidget()
@@ -862,12 +933,13 @@ class DebugTool(QMainWindow):
         connection_box = QGroupBox("连接配置")
         connection_layout = QVBoxLayout(connection_box)
         self.transport_mode = QComboBox()
-        self.transport_mode.addItems(["串口", "TCP 客户端", "TCP 服务端", "UDP"])
+        self.transport_mode.addItems(["串口", "TCP 客户端", "TCP 服务端", "UDP", "CAN"])
         connection_layout.addWidget(self.transport_mode)
         self.connection_stack = QStackedWidget()
         self.connection_stack.addWidget(cfg_box)
         self.network_panel = NetworkPanel(self.settings)
         self.connection_stack.addWidget(self.network_panel)
+        self.connection_stack.addWidget(self.can_panel)
         connection_layout.addWidget(self.connection_stack)
         lv.addWidget(connection_box)
         lv.addWidget(disp_box)
@@ -939,6 +1011,8 @@ class DebugTool(QMainWindow):
         self.setStatusBar(self.status)
         self.lbl_state = QLabel("未连接")
         self.lbl_counter = QLabel("TX: 0  RX: 0")
+        self.lbl_rx_overflow = QLabel()
+        self.lbl_rx_overflow.setToolTip("界面接收缓冲超限时保留最新数据，RX 仍统计全部已接收字节。请查看文件日志；日志错误会另行提示。")
         self.btn_reset_cnt = QPushButton("清零")
         self.btn_reset_cnt.setFlat(True)
         self.btn_reset_cnt.clicked.connect(self._reset_counter)
@@ -946,6 +1020,7 @@ class DebugTool(QMainWindow):
         self.lbl_version.setStyleSheet("color: #888;")
         self.status.addWidget(self.lbl_state, 1)
         self.status.addPermanentWidget(self.lbl_counter)
+        self.status.addPermanentWidget(self.lbl_rx_overflow)
         self.status.addPermanentWidget(self.btn_reset_cnt)
         self.status.addPermanentWidget(self.lbl_version)
         self.transport_mode.currentIndexChanged.connect(self._on_transport_changed)
@@ -953,6 +1028,10 @@ class DebugTool(QMainWindow):
         self.network_panel.sent.connect(self._on_network_sent)
         self.network_panel.status_changed.connect(self._on_network_status)
         self.network_panel.stop_sending.connect(lambda: self.chk_auto_send.setChecked(False))
+        self.can_panel.received.connect(self._on_can_received)
+        self.can_panel.sent.connect(self._on_can_sent)
+        self.can_panel.status_changed.connect(self._on_can_status)
+        self.can_panel.stop_sending.connect(lambda: self.chk_auto_send.setChecked(False))
         self.chk_log_save.toggled.connect(self._sync_shared_log)
 
 
@@ -1313,6 +1392,9 @@ class DebugTool(QMainWindow):
         self.quick_table.setCellWidget(r, 4, btn)
 
     def _send_quick_row(self, btn: QPushButton):
+        if self.transport_mode.currentIndex() == self.CAN_MODE:
+            self.status.showMessage("CAN 请在发送页设置帧 ID 和数据后发送。", 5000)
+            return
         # 通过按钮定位所在行
         for r in range(self.quick_table.rowCount()):
             if self.quick_table.cellWidget(r, 4) is btn:
@@ -1479,8 +1561,12 @@ class DebugTool(QMainWindow):
             return
 
         self.reader = SerialReader(self.ser)
-        self.reader.data_received.connect(self.on_data_received)
-        self.reader.error.connect(self.on_serial_error)
+        reader = self.reader
+        reader.hex_mode = self.chk_rx_hex.isChecked()
+        reader.error.connect(lambda message: self.on_serial_error(message)
+                             if self.reader is reader else None)
+        self.rx_display_dropped = 0
+        self.lbl_rx_overflow.clear()
 
         self.btn_open.setText("关闭串口")
         self.lbl_state.setText(
@@ -1494,14 +1580,19 @@ class DebugTool(QMainWindow):
             self._open_log_file()
         # Finish terminal initialization before any first receive is delivered.
         self.reader.start()
+        self.serial_receive_timer.start()
 
     def close_port(self):
+        self.serial_receive_timer.stop()
         self.chk_modbus_poll.setChecked(False)
         self.modbus_timeout.stop()
         self.pending_modbus_request = None
         self.modbus_rx_buffer.clear()
         if self.reader:
             self.reader.stop()
+            # Account for the final receive batch, but never render an entire
+            # overloaded backlog while the user is trying to disconnect.
+            self._drain_serial_data(final=True)
             self.reader = None
         if self.ser and self.ser.is_open:
             try:
@@ -1545,17 +1636,27 @@ class DebugTool(QMainWindow):
             d = self._log_dir()
             os.makedirs(d, exist_ok=True)
             name = datetime.datetime.now().strftime("%Y-%m-%d") + ".log"
-            self.log_file = open(os.path.join(d, name), "a", encoding="utf-8")
+            self.log_file = AsyncLogWriter(os.path.join(d, name))
+            self._reported_log_error = None
+            self.log_error_timer.start()
             self._write_log_raw(f"\n===== Session start {datetime.datetime.now()} =====\n")
+            if self.reader is not None:
+                self.reader.log_writer = self.log_file
         except Exception as e:
             self.log_file = None
             QMessageBox.warning(self, "日志", f"无法打开日志文件：{e}")
 
     def _close_log_file(self):
+        # This can also be called while settings are loaded during startup.
+        if hasattr(self, "log_error_timer"):
+            self.log_error_timer.stop()
+        if self.reader is not None:
+            self.reader.log_writer = None
         if self.log_file:
             try:
                 self._write_log_raw(f"===== Session end {datetime.datetime.now()} =====\n")
                 self.log_file.close()
+                self._check_log_error()
             except Exception:
                 pass
             self.log_file = None
@@ -1564,9 +1665,23 @@ class DebugTool(QMainWindow):
         if self.log_file:
             try:
                 self.log_file.write(text)
-                self.log_file.flush()
             except Exception:
                 pass
+
+    def _check_log_error(self):
+        if self.log_file is not None and self.log_file.error:
+            message = f"日志保存失败：{self.log_file.error}"
+            if message == self._reported_log_error:
+                return
+            self._reported_log_error = message
+            self.append_log(message, color="#c0392b")
+            self.lbl_state.setText(message)
+            self.lbl_state.setToolTip(message)
+            self.status.showMessage(message)
+
+    def _set_serial_hex_mode(self, enabled):
+        if self.reader is not None:
+            self.reader.hex_mode = enabled
 
     # -------------------------------------------------------------- #
     #  接收
@@ -1578,23 +1693,41 @@ class DebugTool(QMainWindow):
         self.chk_modbus_poll.setChecked(False)
         if self.network_panel.active:
             self.network_panel.stop()
+        if self.can_panel.active or self.can_panel.connecting or self.can_panel.closing:
+            self.can_panel.stop()
         if self.ser is not None:
             self.close_port()
-        self.connection_stack.setCurrentIndex(0 if index == 0 else 1)
-        if index:
+        is_can = index == self.CAN_MODE
+        self.connection_stack.setCurrentIndex(2 if is_can else 0 if index == 0 else 1)
+        if index in (1, 2, 3):
             self.network_panel.mode.setCurrentIndex(index - 1)
             self.network_panel.update_controls()
+        self.can_panel.send_options.setVisible(is_can)
+        for widget in (self.chk_tx_hex, self.chk_tx_newline, self.chk_checksum,
+                       self.cmb_checksum, self.spn_chk_start, self.spn_chk_end,
+                       self.chk_rx_hex):
+            widget.setEnabled(not is_can)
+        self.send_edit.setPlaceholderText(
+            "单帧 CAN 数据（HEX）：01 02 AA FF；留空可发送零字节数据帧。\n"
+            "经典 CAN 最多 8 字节；CAN FD 最多 64 字节；远程帧请清空数据并设置 DLC。"
+            if is_can else self._default_send_placeholder)
+        self.btn_send.setText("发送 CAN 帧" if is_can else "发  送")
         self.chk_auto_reply.setEnabled(index == 0)
         self.chk_auto_reply.setToolTip('自动回复用于串口模式')
         for tab_index in (1, 3, 4):
             self.io_tabs.setTabEnabled(tab_index, index == 0)
-        if index and self.io_tabs.currentIndex() in (1, 3, 4):
+        self.io_tabs.setTabEnabled(2, not is_can)
+        if (index and self.io_tabs.currentIndex() in (1, 3, 4)) or (is_can and self.io_tabs.currentIndex() == 2):
             self.io_tabs.setCurrentIndex(0)
+        self.lbl_rx_overflow.setVisible(index == 0)
         self.lbl_state.setText(self.transport_mode.currentText() + '：未连接')
         self._sync_shared_log()
+        self._update_counter()
 
     def _sync_shared_log(self, *args):
-        connected = bool(self.ser and self.ser.is_open) or self.network_panel.active
+        connected = (bool(self.ser and self.ser.is_open) or self.network_panel.active
+                     or self.can_panel.active or
+                     (self.can_panel.closing and getattr(self.can_panel.bus, 'async_tx', False)))
         if self.chk_log_save.isChecked() and connected:
             if self.log_file is None:
                 self._open_log_file()
@@ -1602,7 +1735,7 @@ class DebugTool(QMainWindow):
             self._close_log_file()
 
     def _on_network_status(self, message):
-        if self.transport_mode.currentIndex() == 0:
+        if self.transport_mode.currentIndex() not in (1, 2, 3):
             return
         label = self.network_panel.mode.currentText()
         if self.network_panel.active:
@@ -1633,12 +1766,104 @@ class DebugTool(QMainWindow):
                         color='#1b5e20' if direction == 'RX' else '#0d47a1')
         self._write_log_raw(f'{datetime.datetime.now().isoformat(timespec="milliseconds")} {direction} [{label} {peer}] {text}\n')
 
-    def on_data_received(self, data: bytes):
-        if self.transport_mode.currentIndex() != 0:
+    def _on_can_status(self, message):
+        is_can = self.transport_mode.currentIndex() == self.CAN_MODE
+        # Background device discovery also runs when the serial page is shown.
+        # Only carry CAN status across a mode switch to finish a closing session.
+        if not is_can and not self.can_panel.closing and not getattr(self, '_can_status_pending', False):
             return
-        self.serial_terminal.output.feed(data)
-        self.rx_bytes += len(data)
+        self._can_status_pending = self.can_panel.closing
+        if self.can_panel.active or self.can_panel.closing:
+            self._sync_shared_log()
+        if is_can:
+            self.lbl_state.setText('CAN：' + message)
+        if getattr(self, '_can_exit_pending', False):
+            self.status.showMessage('退出前等待 CAN 驱动关闭：' + message)
+        self.append_log('[CAN] ' + message)
+        self._write_log_raw(f'{datetime.datetime.now().isoformat(timespec="milliseconds")} [CAN] {message}\n')
+        if not self.can_panel.active:
+            self._sync_shared_log()
         self._update_counter()
+
+    @staticmethod
+    def _can_frame_text(frame):
+        kind = 'ERROR' if frame.error else 'RTR' if frame.remote else 'FD' if frame.fd else 'DATA'
+        width = 8 if frame.extended or frame.error else 3
+        flags = ['EXT' if frame.extended else 'STD', kind]
+        if frame.bitrate_switch:
+            flags.append('BRS')
+        if frame.error_state_indicator:
+            flags.append('ESI')
+        length = frame.dlc if frame.remote else len(frame.data)
+        return (f'ID=0x{frame.can_id:0{width}X} {" ".join(flags)} LEN={length} '
+                f'DATA={bytes_to_hex_str(frame.data) if frame.data else "-"}')
+
+    def _log_can_frames(self, frames, direction):
+        shown, records = [], []
+        channel = self.can_panel.interface.currentText().strip()
+        backend = self.can_panel.backend.currentData()
+        if backend != 'socketcan':
+            channel = f'{backend}:{channel}'
+        marker = '<<' if direction == 'RX' else '>>'
+        for frame in frames:
+            timestamp = (datetime.datetime.fromtimestamp(frame.timestamp)
+                         if frame.timestamp is not None else datetime.datetime.now())
+            details = f'[CAN {channel}] {self._can_frame_text(frame)}'
+            prefix = f'[{timestamp.strftime("%H:%M:%S.%f")[:-3]}] ' if self.chk_show_time.isChecked() else ''
+            shown.append(f'{prefix}{marker} {details}')
+            records.append(f'{timestamp.isoformat(timespec="milliseconds")} {direction} {details}\n')
+        if shown:
+            self.append_log('\n'.join(shown), color='#1b5e20' if direction == 'RX' else '#0d47a1')
+            self._write_log_raw(''.join(records))
+
+    def _on_can_received(self, frames):
+        # The worker may still have received frames queued when a mode switch
+        # starts closing it; these belong in the log as well as confirmed TX.
+        self.rx_bytes += sum(len(frame.data) for frame in frames)
+        self._update_counter()
+        self._log_can_frames(frames, 'RX')
+
+    def _on_can_sent(self, frame):
+        # A driver send already in progress can finish after a mode switch.
+        # Preserve its confirmed TX record while asynchronous shutdown drains.
+        self.tx_bytes += len(frame.data)
+        self._update_counter()
+        self._log_can_frames([frame], 'TX')
+
+    def _drain_serial_data(self, final=False):
+        reader = self.reader
+        if reader is None:
+            return
+        chunks, received, dropped = reader.take_received(self.SERIAL_UI_BATCH_BYTES)
+        if final:
+            # Retain the newest preview on disconnect, accounting for discarded
+            # UI history without affecting the already queued file log.
+            remaining, extra_received, extra_dropped = reader.take_received(reader.MAX_PENDING_BYTES)
+            received += extra_received
+            dropped += extra_dropped
+            if remaining:
+                all_data = b"".join(chunks + remaining)
+                dropped += max(0, len(all_data) - self.SERIAL_UI_BATCH_BYTES)
+                chunks = [all_data[-self.SERIAL_UI_BATCH_BYTES:]]
+        self.rx_bytes += received
+        self._update_counter()
+        self._check_log_error()
+        if dropped:
+            self.rx_display_dropped += dropped
+            self.lbl_rx_overflow.setText(f"界面已跳过 {self.rx_display_dropped:,} B")
+            self.serial_terminal.note_gap(dropped)
+            # A protocol parser must not treat noncontiguous data as a frame.
+            self.chk_auto_reply.setChecked(False)
+            self.chk_modbus_poll.setChecked(False)
+            if self.pending_modbus_request:
+                self.modbus_result.setPlainText("串口界面处理超限，响应数据不连续；已停止自动读取，请重新读取。")
+            self.pending_modbus_request = None
+            self.modbus_timeout.stop()
+            self.modbus_rx_buffer.clear()
+        if not chunks:
+            return
+        data = b"".join(chunks)
+        self.serial_terminal.feed(data)
 
         if self.chk_rx_hex.isChecked():
             shown = bytes_to_hex_str(data)
@@ -1650,14 +1875,12 @@ class DebugTool(QMainWindow):
 
         ts = f"[{now_ms()}] " if self.chk_show_time.isChecked() else ""
         self.append_log(f"{ts}<< {shown}", color="#1b5e20")
-        self._write_log_raw(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} RX <- {shown}\n")
-
-        if self.pending_modbus_request:
-            self._receive_modbus_data(data)
-
-        # 自动回复
-        if self.chk_auto_reply.isChecked():
-            self._check_auto_reply(data)
+        if not final:
+            for chunk in chunks:
+                if self.pending_modbus_request:
+                    self._receive_modbus_data(chunk)
+                if self.chk_auto_reply.isChecked():
+                    self._check_auto_reply(chunk)
 
     def _send_terminal_data(self, data: bytes, sensitive: bool = False) -> bool:
         if not (self.ser and self.ser.is_open):
@@ -1681,13 +1904,20 @@ class DebugTool(QMainWindow):
     def append_log(self, text: str, color: str = "#202020"):
         # 行数和字符数同时限制，避免无换行的大包使文档无限增长。
         text = (text + "\n")[-self.MAX_DISPLAY_CHARS:]
+        # Qt lays out an entire text block on every append. Limit individual
+        # lines too, especially the 3x expansion of a large HEX receive batch.
+        width = self.MAX_DISPLAY_LINE_CHARS
+        text = "\n".join("\n".join(line[i:i + width] for i in range(0, len(line), width))
+                         for line in text.split("\n"))[-self.MAX_DISPLAY_CHARS:]
         scroll = self.recv_edit.verticalScrollBar()
         old_scroll = scroll.value()
         cursor = self.recv_edit.textCursor()
         excess = self.recv_edit.document().characterCount() - 1 + len(text) - self.MAX_DISPLAY_CHARS
         if excess > 0:
-            cursor.movePosition(QTextCursor.Start)
-            cursor.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor, excess)
+            # NextCharacter with a large repeat count walks every glyph in Qt
+            # (especially costly for HEX). Select the range by index instead.
+            cursor.setPosition(0)
+            cursor.setPosition(excess, QTextCursor.KeepAnchor)
             cursor.removeSelectedText()
         cursor.movePosition(QTextCursor.End)
         fmt = QTextCharFormat()
@@ -1702,6 +1932,11 @@ class DebugTool(QMainWindow):
     #  发送
     # -------------------------------------------------------------- #
     def on_send_clicked(self):
+        if self.transport_mode.currentIndex() == self.CAN_MODE:
+            text = self.send_edit.toPlainText()
+            if self.can_panel.send_text(text):
+                self._push_history(text)
+            return
         if self.transport_mode.currentIndex() == 0 and not (self.ser and self.ser.is_open):
             if not self.chk_auto_send.isChecked():
                 QMessageBox.information(self, "提示", "请先打开串口。")
@@ -2294,10 +2529,16 @@ class DebugTool(QMainWindow):
     #  计数器
     # -------------------------------------------------------------- #
     def _update_counter(self):
-        self.lbl_counter.setText(f"TX: {self.tx_bytes}  RX: {self.rx_bytes}")
+        if self.transport_mode.currentIndex() == self.CAN_MODE:
+            panel = self.can_panel
+            self.lbl_counter.setText(f"CAN TX: {panel.tx_frames} 帧 / {panel.tx_bytes} B  "
+                                     f"RX: {panel.rx_frames} 帧 / {panel.rx_bytes} B")
+        else:
+            self.lbl_counter.setText(f"TX: {self.tx_bytes}  RX: {self.rx_bytes}")
 
     def _reset_counter(self):
         self.network_panel.reset_counts()
+        self.can_panel.reset_counts()
         self.tx_bytes = self.rx_bytes = 0
         self._update_counter()
 
@@ -2398,6 +2639,7 @@ class DebugTool(QMainWindow):
         s = self.settings
         self.ssh_panel.save_settings()
         self.network_panel.save_settings()
+        self.can_panel.save_settings()
         self.settings.setValue("transport_mode", self.transport_mode.currentIndex())
         s.setValue("baud", self.cmb_baud.currentText())
         s.setValue("data", self.cmb_data.currentText())
@@ -2456,7 +2698,28 @@ class DebugTool(QMainWindow):
         s.setValue("geometry", self.saveGeometry())
 
     # -------------------------------------------------------------- #
+    def _wait_for_can_exit(self):
+        if self.can_panel.closing:
+            QTimer.singleShot(50, self._wait_for_can_exit)
+        else:
+            self.close()
+
     def closeEvent(self, ev):
+        # Let the worker release the hardware and deliver its final confirmed
+        # sends before Qt exits. Driver calls never run or join on this thread.
+        if getattr(self.can_panel.bus, 'async_tx', False):
+            if not getattr(self, '_can_exit_pending', False):
+                self._can_exit_pending = True
+                self.chk_auto_send.setChecked(False)
+                self.transport_mode.setEnabled(False)
+                self.connection_stack.setEnabled(False)
+                self.btn_send.setEnabled(False)
+                self.chk_auto_send.setEnabled(False)
+                self.can_panel.stop()
+                self.status.showMessage('正在关闭 CAN 驱动，完成后退出…')
+                QTimer.singleShot(50, self._wait_for_can_exit)
+            ev.ignore()
+            return
         if self.local_terminal.process is not None:
             if not getattr(self, '_local_closing', False):
                 self._local_closing = True
@@ -2476,6 +2739,7 @@ class DebugTool(QMainWindow):
             self._save_settings()
         finally:
             self.network_panel.stop()
+            self.can_panel.stop()
             self.close_port()
         super().closeEvent(ev)
 
@@ -2483,8 +2747,9 @@ class DebugTool(QMainWindow):
 # ------------------------------------------------------------------ #
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("DebugTool")
-    app.setApplicationDisplayName("DebugTool")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    app.setApplicationVersion(__version__)
     app.setOrganizationName("RUIO")
     # GNOME Shell uses the desktop file ID to associate a running window with
     # its launcher and icon. The value must match qt5com.desktop without suffix.

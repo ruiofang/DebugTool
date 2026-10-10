@@ -1,15 +1,15 @@
 # DebugTool
 
-启动入口为 `main.py`，打包程序名为 `DebugTool`。版本保持 V1.0.2。为兼容原有设置，继续使用 `serial_tool.ini`、`qt5com` 配置目录及 Modbus 配置格式；T113 的服务名和部署路径也保持兼容。
+启动入口为 `main.py`，打包程序名为 `DebugTool`。版本号统一由 [VERSION](VERSION) 管理，打包时输入一次即可。为兼容原有设置，继续使用 `serial_tool.ini`、`qt5com` 配置目录及 Modbus 配置格式；T113 的服务名和部署路径也保持兼容。
 
-一个基于 **Python 3 + PyQt5 + pyserial + Paramiko** 的跨平台串口、SSH、TCP / UDP 调试工具，打包后为便携式可执行程序。
+一个基于 **Python 3 + PyQt5 + pyserial + Paramiko** 的串口、SSH、TCP / UDP 和 CAN 调试工具，打包后为便携式可执行程序。CAN 提供 Linux SocketCAN、PEAK PCAN 和 candleLight（gs_usb）驱动选项；Windows 使用 PCAN 或 candleLight。Linux SocketCAN 使用系统 CAN 驱动，无需额外 Python CAN 库。
 
-- **版本**：V1.0.2
+- **当前版本**：[V1.0.3](VERSION)
 - **作者**：RUIO
 - **协议**：MIT License
 
 ---
-![V1.0.2 深色主题](/image/main.png)
+![V1.0.3 深色主题](/image/main.png)
 
 主图为 V1.0.2 实际界面。
 
@@ -49,6 +49,65 @@ python3 main.py
 直接运行 `main.py` 时会自动使用项目 `.venv`（若存在），无需先激活环境；编辑器选择其他 Python 也可启动。Windows 安装依赖时使用 `.venv\Scripts\python.exe`。
 
 Linux 使用 Fcitx 时，若虚拟环境 Qt 缺少 Fcitx 插件，源码启动会优先选用已安装且兼容当前 Python 的系统 PyQt5，避免混用不同 Qt 补丁版本的输入法插件；其他依赖仍使用虚拟环境，不修改系统配置。
+
+### 大流量串口接收
+
+- 接收线程与界面使用有上限的缓冲，界面每 20 ms 最多处理 32 KiB，避免持续输入造成 Qt 事件队列无限堆积。接收区保留最近 2000 行 / 512 Ki 字符，单行超过 1024 字符时分段显示。
+- 隐藏的“串口终端”不解析数据，保留最近 64 KiB，切到终端后按小批次回放。显示跟不上时会提示省略的字节数；设备提示符不完整时可在 Linux shell 下点击“刷新提示符”。
+- 接收缓冲超过 1 MiB 时，界面保留最新数据，状态栏显示“界面已跳过 … B”；RX 计数仍包含全部已接收字节。出现缺口时停止自动回复和 Modbus 自动读取，避免用不连续的数据处理协议。
+- “保存日志到文件”使用独立写入线程，记录在界面裁剪前排队，正常写入时不受显示省略影响。磁盘错误或待写日志超过 8 MiB 会明确报告“日志保存失败”并停止继续记录，避免慢磁盘拖死界面；此时日志可能不完整。
+
+串口回归与伪串口压力测试（无需连接设备）：
+
+```bash
+QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s qa -v
+```
+
+### CAN 调试
+
+#### Linux SocketCAN
+
+1. 在左侧“连接配置”选择 **CAN**，CAN 驱动选择 **SocketCAN（Linux）**，选择或输入接口名称（例如 `can0`）。点击“刷新”重新枚举系统 CAN 接口。
+2. 在左侧选择与设备一致的 **仲裁比特率**；需要 CAN FD 时勾选“启用 CAN FD”并选择 **FD 数据比特率**。点击 **打开**，程序自动配置并启用接口，然后开始接收。需要权限时会弹出系统认证窗口，完成认证即可，无需手动执行命令。已经启用且参数匹配的接口会直接连接；修改比特率或 FD 设置会重新配置系统接口。
+3. 在“发送”页填写 **CAN ID (HEX)**，选择标准/扩展 ID 和帧类型，在发送框填写单帧 HEX 数据，例如 `01 02 AA 55`，点击“发送 CAN 帧”。“循环发送”沿用旁边的毫秒间隔，最小 10 ms。
+4. 接收区逐帧显示时间、接口、方向、ID、格式、长度和 HEX 数据。勾选“保存日志到文件”后保存同样的帧信息；帧间边界保持独立，不按字节流拼接。
+
+例如设备为 **500 kbit/s**，选择 `can0`、仲裁比特率 `500000` 后点击“打开”。CAN FD 还需要适配器与其他节点支持，并设置对应的数据比特率。已存在的虚拟 `vcan` 接口会自动启用，不配置比特率。程序不创建不存在的接口，USB-CAN 仍需系统驱动识别。
+
+自动配置使用系统 `ip` 工具和 `pkexec`；普通桌面会通过 polkit 认证窗口申请权限，主界面仍以普通用户运行。未安装相关工具、没有桌面认证代理、取消认证或驱动不支持选定参数时，界面会显示失败原因。认证和配置在独立进程完成，可取消打开；取消或退出后不会再自动连接，已经授权执行的系统配置可能仍会完成。“高级…”保留系统命令供排查使用。详细配置见 [Linux 内核 SocketCAN 文档](https://docs.kernel.org/networking/can.html#how-to-use-socketcan) 和 [polkit 认证说明](https://polkit.pages.freedesktop.org/polkit/pkexec.1.html)。
+
+点击 CAN 的 **关闭** 会先停止收发、释放 socket，再自动将对应接口设为 **DOWN**，需要权限时弹出系统认证窗口。只有检查到接口确实 DOWN 后才显示停用成功；取消认证或停用失败会显示原因，并可点击“重试停用”再次执行。再次点击“打开”会按所选参数重新启用接口。停用接口或修改比特率会影响同一接口上的其他程序。切换通信模式、退出程序或遇到收发错误时，仅释放本程序的连接，不主动停用系统接口。
+
+#### Windows PCAN / candleLight
+
+在“连接配置”选择 **CAN**，再选择对应的 **CAN 驱动**。Windows 默认 PCAN；SocketCAN 选项不可用。设备枚举、打开、收发、关闭都在后台执行，点击“打开”后可取消等待；每种驱动分别记忆通道。
+
+| 驱动选项 | 通道示例 | 所需系统驱动 | 支持的帧 |
+| --- | --- | --- | --- |
+| PCAN（PEAK） | `PCAN_USBBUS1` | PEAK 驱动及匹配程序位数的 `PCANBasic.dll` | 经典 CAN / RTR；CAN FD 需 PCAN FD 硬件 |
+| candleLight（gs_usb） | `0`（首个设备）、`1`（第二个） | 支持 gs_usb 协议的固件及 WinUSB 等 libusb 可访问的 USB 驱动 | 经典 CAN / RTR；当前后端不支持 CAN FD |
+
+1. 插入设备，选择驱动并点击 **刷新**，选中通道；也可直接输入通道。candleLight 数字序号按本次枚举结果确定，多设备重新插拔后请重新确认。
+2. 设置与总线一致的仲裁比特率。PCAN FD 硬件可勾选“启用 CAN FD”并设置数据比特率；candleLight 的 FD/BRS 控件禁用。
+3. 点击 **打开**，等待状态显示“已打开”后发送。收发、ID/格式过滤、循环发送、帧计数和日志沿用同一界面。点击 **关闭** 释放本程序的驱动通道；Windows 没有 Linux 的 `UP/DOWN` 操作，也不调用 `ip` 或 `pkexec`。
+
+已有正确驱动可直接使用。PCAN 如果报告找不到 `PCANBasic.dll`，请检查 PEAK PCAN-Basic 运行库及 32/64 位是否与打包所用 Python 一致；程序不分发 PEAK 厂商 DLL。candleLight 即使安装了厂商驱动，也须确认它提供 gs_usb 协议且 USB 驱动允许 libusb 访问；仅显示为串口的固件或其他厂商专有协议不适用。程序不会替换设备驱动。参考 [PEAK PCAN-Basic](https://www.peak-system.com/products/software/development-packages/pcan-basic/?L=1)、[python-can PCAN](https://python-can.readthedocs.io/en/stable/interfaces/pcan.html) 和 [gs_usb 接口说明](https://python-can.readthedocs.io/en/stable/interfaces/gs_usb.html)。
+
+Windows 源码运行和自行打包时，先在同一 Python 环境运行 `python -m pip install -r requirements.txt`。依赖固定为已适配的 python-can / gs-usb / PyUSB 版本；`build.py` 检查 Windows CAN 依赖，并收集动态驱动模块和 libusb DLL。Linux 如需使用可选 PCAN/gs_usb 后端，可另外安装 `python-can==4.6.1 gs-usb==0.3.1 pyusb==1.3.1 libusb-package==1.0.30.0 uptime==3.0.1`；常规 Linux USB-CAN 优先选择系统 SocketCAN 接口。
+
+驱动接收队列有容量限制，溢出会显示丢帧数。发送先进入有界队列，只有驱动返回发送成功后才增加 TX 计数及写入 TX 日志；关闭时丢弃尚未交给驱动的待发帧，并等待正在进行的调用返回。拔出设备或驱动报错会停止循环发送并报告原因。退出程序会异步等待驱动释放通道和最后的 TX 确认；如果厂商驱动调用未返回，界面显示等待状态。candleLight 时间戳由首帧接收时的本机时间与设备相对时间换算。
+
+Windows 回归使用模拟驱动验证界面、后台队列和打包参数；实际 Windows USB 收发、具体适配器 FD 能力和厂商驱动兼容性仍需在目标机器验证。
+
+#### 收发与日志
+
+- **帧格式**：标准 ID 为 `000–7FF`，扩展 ID 为 `00000000–1FFFFFFF`，ID 默认按十六进制解释。经典数据帧为 0–8 字节；RTR 的发送框必须为空，用“请求长度”设置 DLC 0–8。CAN FD 不支持 RTR，允许 0–8、12、16、20、24、32、48、64 字节。非法 ID、奇数位/无效 HEX、超长数据会拒绝发送，不会自动截断、分帧或补零。
+- **发送选项**：CAN 使用专用帧设置，数据固定为 HEX；普通串口的附加换行和校验和不会进入 CAN 帧。自动回复、Modbus、串口终端和普通快捷按钮在 CAN 模式下禁用，避免误用字节流协议；SSH/本地终端仍可单独使用。
+- **过滤**：连接前设置 RX ID、掩码和格式。掩码 `0` 接收全部 ID；精确接收标准 `123` 可设 ID=`123`、掩码=`7FF`、格式=标准帧；扩展精确过滤用掩码=`1FFFFFFF`。默认关闭本程序的自身发送回环；“接收总线错误帧”独立控制错误通知，不受普通 ID 过滤影响。
+- **计数和错误**：CAN 模式同时显示帧数和载荷字节数，RTR 字节数为 0。TX 表示内核或驱动已接受该帧，不代表其他节点已 ACK。检测到 BUS-OFF 会停止循环发送；SocketCAN 保留错误诊断连接，驱动异常会关闭 PCAN/gs_usb 通道。接收队列溢出会显示丢帧数，出现该提示时显示和日志均可能缺帧。
+- **大流量和退出**：每 20 ms 最多读取 256 帧或处理 6 ms，再批量更新现有有界接收区；日志使用后台写入。切换模式、关闭接口或退出时停止循环发送并释放连接。保存上次参数，重新启动不会自动打开接口或发帧。
+
+软件回归：`QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s qa -v`。另可运行 `bash qa/run_socketcan_vcan_tests.sh`，在独立用户/网络/挂载命名空间创建临时 `vcan_test`，通过实际 Linux CAN socket 验证标准/扩展/RTR/FD、内核过滤、回环、从 DOWN 状态一键打开、点击关闭后 DOWN 并重新打开，以及主窗口收发、循环发送和日志。需要内核支持 vcan 和非特权用户命名空间；测试不会使用真实 `can0`。
 
 ### 本地终端
 
@@ -157,10 +216,31 @@ sudo usermod -aG dialout $USER     # 重新登录生效
 ```
 
 ### 打包为单文件可执行程序
+
+运行脚本后输入这次的版本号，直接回车则沿用当前版本：
+
 ```bash
-python3 build.py            # 产物: dist/DebugTool-V1.0.2[.exe|-linux]
-python3 build.py --clean    # 清理构建产物
+python3 build.py
 ```
+
+也可以用一条命令指定版本并打包：
+
+```bash
+python3 build.py --version 1.0.3
+```
+
+版本号自动保存为 `V1.0.3`，输出 `dist/DebugTool-V1.0.3-linux`（Windows 为 `.exe`）。程序底部版本、应用元数据和 Windows 文件属性使用同一个版本。支持三段或四段数字，例如 `1.0.3`、`V1.0.3.1`；每段为 0–65535，前缀 `V` 可省略。若依赖装在项目虚拟环境中，将上述 `python3` 换成 `.venv/bin/python`（Windows 为 `.venv\Scripts\python.exe`）。
+
+```bash
+python3 build.py --set-version 1.0.3  # 只保存版本，不打包
+python3 build.py --yes               # 不询问，使用已保存的版本打包
+python3 build.py --clean             # 清理构建产物，保留 VERSION
+```
+
+- `VERSION` 是唯一版本来源，也可以直接修改它。无需修改 `main.py`、`build.py`、`version_info.txt` 或 `.spec`；后两者是自动生成的打包文件。README 中截图及更新记录里的版本号表示历史版本。
+- 每次打包都会用 `VERSION` 覆盖生成 `version_info.txt`，同步 `FileVersion`、`ProductVersion`、`filevers` 和 `prodvers`。Linux 打包时也会更新此文件；Windows 打包时还会将它嵌入 EXE。该文件中的旧版本不会反向覆盖 `VERSION`。
+- 在终端交互运行时会提示版本；没有交互输入的环境自动使用当前版本，也可通过 `--version` 明确指定。
+- `VERSION` 会嵌入单文件程序；发布时不需要在可执行文件旁再放一份，修改源码版本也不会改变已打包程序的版本。
 - 打包前会自动调用 `gen_icon.py` 生成 `app.png` / `app.ico`（已存在则跳过）。
 - Windows 自动为 EXE 嵌入版本资源（文件属性页可见版本号与作者）。
 - Linux / Windows 均输出 `--onefile` 单文件，双击即可运行。
@@ -170,6 +250,7 @@ python3 build.py --clean    # 清理构建产物
 sudo ./install.sh                 # 安装到 /opt/qt5com，创建桌面快捷方式
 sudo ./install.sh --uninstall     # 卸载
 ```
+默认安装 `VERSION` 对应的 Linux 产物，尚未打包该版本时会明确报错。也可用 `sudo ./install.sh /path/to/DebugTool` 指定已有程序；只分发安装脚本和产物、没有 `VERSION` 时按版本号选择最新产物。
 安装后：
 - 终端命令：`DebugTool`（保留 `qt5com` 兼容命令）
 - 应用菜单：`DebugTool`
@@ -196,7 +277,7 @@ python3 gen_icon.py           # 重新生成 app.png / app.ico
 ## 📂 运行期目录结构
 ```
 程序目录/
-├── DebugTool-V1.0.2-linux  # Linux 可执行文件；Windows 为 DebugTool-V1.0.2.exe
+├── DebugTool-<版本号>-linux  # Linux 可执行文件；Windows 为 DebugTool-<版本号>.exe
 ├── serial_tool.ini           # 便携配置
 └── logs/
     └── 2026-04-18.log        # 按日期归档日志
@@ -212,6 +293,14 @@ python3 gen_icon.py           # 重新生成 app.png / app.ico
 ---
 
 ## 更新记录
+
+### V1.0.3
+
+- 修复串口大流量接收时界面卡顿：限制接收、显示和终端缓冲，日志改为后台写入，并明确提示缓冲溢出或日志保存失败。
+- 新增 Linux SocketCAN 调试，支持标准帧、扩展帧、RTR、CAN FD、接收过滤、循环发送和帧日志；可在界面直接配置比特率、打开接口，点击关闭后确认接口 DOWN。
+- 新增 Windows PCAN 和 candleLight（gs_usb）驱动选项；PCAN FD 需对应硬件，candleLight 当前支持经典 CAN / RTR。
+- CAN 驱动在后台执行枚举和收发，发送成功后才计数、记录日志；关闭或切换模式时保留已接收及已确认发送的尾部帧。
+- 统一使用 `VERSION` 管理版本号，支持打包时一次设置，并自动覆盖生成 `version_info.txt`，同步程序版本、产物名称和 Windows 文件属性。
 
 ### V1.0.2
 

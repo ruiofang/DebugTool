@@ -2,3 +2,9 @@ PyQt5>=5.15
 pyserial>=3.5
 paramiko>=2.9.3
 pyte>=0.8.2,<0.9
+# Windows CAN backends. Linux SocketCAN remains dependency-free.
+python-can==4.6.1; sys_platform == 'win32'
+gs-usb==0.3.1; sys_platform == 'win32'
+pyusb==1.3.1; sys_platform == 'win32'
+libusb-package==1.0.30.0; sys_platform == 'win32'
+uptime==3.0.1; sys_platform == 'win32'

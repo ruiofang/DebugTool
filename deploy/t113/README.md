@@ -9,6 +9,8 @@
 启动入口为 `app/main.py`，工具名称为 DebugTool；服务名保持 `qt5com`。
 本目录的 `qt5com.service` 使用上述部署路径，与板端启动配置一致。
 此目录的 Python 和 Qt 不替换系统库。桌面端 x86_64 打包产物不能在 ARM 上运行。
+更新板端源码时，请将项目根目录的 `VERSION` 和 `app_meta.py` 一起同步到 `app/`，
+它们是源码运行时读取应用版本所需的文件。
 
 ```sh
 systemctl start qt5com   # 在设备屏幕打开

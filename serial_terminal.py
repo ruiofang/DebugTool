@@ -1,4 +1,7 @@
 """Interactive VT console over the application's existing serial port."""
+from collections import deque
+import time
+
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                             QComboBox, QApplication, QToolButton, QMenu)
@@ -6,11 +9,24 @@ from ssh_terminal import SSHTerminal
 
 
 class SerialTerminalPanel(QWidget):
+    MAX_PENDING_BYTES = 64 * 1024
+    FLUSH_INTERVAL_MS = 20
+    PARSE_SLICE_BYTES = 1024
+    PARSE_BUDGET_SECONDS = 0.006
+
     def __init__(self, send, toggle_port, parent=None, settings=None):
         super().__init__(parent)
         self.send = send
         self.settings = settings
         self._session_description = None
+        self._pending = deque()
+        self._pending_bytes = 0
+        self._gap_bytes = 0
+        self._suppress_buffered_responses = False
+        self._reset_after_gap = False
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setInterval(self.FLUSH_INTERVAL_MS)
+        self._flush_timer.timeout.connect(self._drain_pending)
         layout = QVBoxLayout(self)
         row = QHBoxLayout()
         self.status = QLabel()
@@ -20,7 +36,7 @@ class SerialTerminalPanel(QWidget):
         self.output = SSHTerminal()
         self.output.responses_enabled = False
         self.output.data_ready.connect(self.send_input)
-        clear.clicked.connect(self.output.clear)
+        clear.clicked.connect(self._clear_output)
         row.addWidget(self.status, 1)
         row.addWidget(self.open_button)
         row.addWidget(clear)
@@ -73,6 +89,104 @@ class SerialTerminalPanel(QWidget):
         self.update_keys()
         self.set_connected(False)
 
+    def feed(self, data):
+        """Queue a bounded tail; a hidden terminal never parses serial traffic."""
+        if not data:
+            return
+        if not self.isVisible():
+            # Queries received while this tab was inactive must not become
+            # device writes merely because the user later opens the tab.
+            self._suppress_buffered_responses = True
+        data = bytes(data)
+        self._pending.append(data)
+        self._pending_bytes += len(data)
+        excess = self._pending_bytes - self.MAX_PENDING_BYTES
+        if excess > 0:
+            self._gap_bytes += excess
+            self._suppress_buffered_responses = True
+            self._reset_after_gap = True
+            while excess:
+                first = self._pending.popleft()
+                removed = min(excess, len(first))
+                if removed < len(first):
+                    self._pending.appendleft(first[removed:])
+                self._pending_bytes -= removed
+                excess -= removed
+        self._schedule_drain()
+
+    def note_gap(self, count):
+        """An upstream receive gap also invalidates older queued VT sequences."""
+        if count <= 0:
+            return
+        self._gap_bytes += count + self._pending_bytes
+        self._pending.clear()
+        self._pending_bytes = 0
+        self._suppress_buffered_responses = True
+        self._reset_after_gap = True
+        self._schedule_drain()
+
+    def clear_pending(self):
+        self._flush_timer.stop()
+        self._pending.clear()
+        self._pending_bytes = 0
+        self._gap_bytes = 0
+        self._suppress_buffered_responses = False
+        self._reset_after_gap = False
+
+    def _clear_output(self):
+        self.clear_pending()
+        self.output.resume_stream()
+        self.output.clear()
+
+    def _schedule_drain(self):
+        if (self._pending or self._gap_bytes) and self.isVisible():
+            if not self._flush_timer.isActive():
+                self._flush_timer.start()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._schedule_drain()
+
+    def hideEvent(self, event):
+        self._flush_timer.stop()
+        super().hideEvent(event)
+
+    def _drain_pending(self):
+        if not self.isVisible():
+            self._flush_timer.stop()
+            return
+        started = time.monotonic()
+        responses_enabled = self.output.responses_enabled
+        if self._suppress_buffered_responses:
+            self.output.responses_enabled = False
+        try:
+            if self._gap_bytes:
+                skipped = self._gap_bytes
+                self._gap_bytes = 0
+                # Reset partial UTF-8/escape sequences before replaying the tail.
+                self.output.resume_stream()
+                self.output.append_notice(
+                    f'[终端显示已省略 {skipped} 字节；可按 Ctrl+L 刷新提示符]')
+            while self._pending:
+                data = self._pending.popleft()
+                part = data[:self.PARSE_SLICE_BYTES]
+                if len(data) > len(part):
+                    self._pending.appendleft(data[len(part):])
+                self._pending_bytes -= len(part)
+                self.output.feed(part)
+                if time.monotonic() - started >= self.PARSE_BUDGET_SECONDS:
+                    break
+            if not self._pending:
+                self._flush_timer.stop()
+                if self._suppress_buffered_responses:
+                    # Never let a truncated query straddle the replay/live boundary.
+                    if self._reset_after_gap:
+                        self.output.resume_stream()
+                    self._reset_after_gap = False
+                    self._suppress_buffered_responses = False
+        finally:
+            self.output.responses_enabled = responses_enabled
+
     def update_keys(self):
         self.output.return_bytes = self.newline.currentData()
         value = self.backspace.currentData()
@@ -120,6 +234,7 @@ class SerialTerminalPanel(QWidget):
             # Reopening a serial port does not make a shell resend its prompt.
             # Keep the last screen for the same device, but never mix devices.
             if description != self._session_description:
+                self.clear_pending()
                 self.output.reset_stream()
             else:
                 self.output.resume_stream()
@@ -128,6 +243,12 @@ class SerialTerminalPanel(QWidget):
         else:
             # Keep the final screen available for diagnosis after disconnect.
             self.output.decoder.reset()
+            # Retain the bounded tail for inspection, but never answer queries
+            # from the previous connection when the same port is reopened.
+            if self._pending:
+                self._suppress_buffered_responses = True
+                self._reset_after_gap = True
+        self._schedule_drain()
 
     def send_input(self, data):
         if not self.output.connected:

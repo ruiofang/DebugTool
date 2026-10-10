@@ -58,26 +58,70 @@ uninstall() {
     echo "✔ 卸载完成。"
 }
 
-install_app() {
-    need_root "$@"
-
-    # 1. 定位可执行文件
+select_executable() {
+    # VERSION is data, never a shell script. An explicit file always wins.
     EXE=""
-    if [[ -n "$1" && -f "$1" ]]; then
+    if [[ -n "${1:-}" ]]; then
+        if [[ ! -f "$1" ]]; then
+            echo "✘ 指定的可执行文件不存在: $1" >&2
+            return 1
+        fi
         EXE="$1"
+    elif [[ -f "$HERE/VERSION" ]]; then
+        local version component normalized=""
+        local -a components
+        version=$(<"$HERE/VERSION")
+        # Match app_meta.normalize_version: allow surrounding whitespace and
+        # an optional V/v prefix, then canonicalize numeric components.
+        version=${version#"${version%%[![:space:]]*}"}
+        version=${version%"${version##*[![:space:]]}"}
+        if [[ ! "$version" =~ ^[Vv]?[0-9]{1,5}(\.[0-9]{1,5}){2,3}$ ]]; then
+            echo "✘ VERSION 格式错误，应为 V1.2.3 或 V1.2.3.4。" >&2
+            return 1
+        fi
+        IFS='.' read -r -a components <<< "${version#[Vv]}"
+        for component in "${components[@]}"; do
+            if (( 10#$component > 65535 )); then
+                echo "✘ VERSION 每段数值必须在 0～65535 之间。" >&2
+                return 1
+            fi
+            normalized+="${normalized:+.}$((10#$component))"
+        done
+        version="V$normalized"
+        EXE="$HERE/dist/DebugTool-${version}-linux"
+        if [[ ! -f "$EXE" || ! -x "$EXE" ]]; then
+            echo "✘ 未找到 VERSION 对应的可执行文件: $EXE" >&2
+            echo "    请先运行 python3 build.py，或显式指定要安装的文件。" >&2
+            return 1
+        fi
     else
-        # 仅选择 Linux 可执行文件，避免误选源码压缩包。
-        for CANDIDATE in "$HERE"/dist/DebugTool-*-linux; do
-            if [[ -f "$CANDIDATE" && -x "$CANDIDATE" ]]; then
-                EXE="$CANDIDATE"
+        # Standalone distributions may not include VERSION. Sort numerically
+        # so V1.0.10 is newer than V1.0.9, and exclude backups/archives.
+        local candidate
+        local -a candidates=()
+        for candidate in "$HERE"/dist/DebugTool-*-linux; do
+            if [[ -f "$candidate" && -x "$candidate" ]]; then
+                candidates+=("$candidate")
             fi
         done
+        if (( ${#candidates[@]} )); then
+            while IFS= read -r -d '' candidate; do
+                EXE="$candidate"
+            done < <(printf '%s\0' "${candidates[@]}" | sort -z -V)
+        fi
     fi
     if [[ -z "$EXE" ]]; then
         echo "✘ 未找到可执行文件。请先 'python3 build.py' 或手动指定:"
         echo "    sudo $0 /path/to/DebugTool"
-        exit 1
+        return 1
     fi
+}
+
+install_app() {
+    need_root "$@"
+
+    # 1. 定位可执行文件
+    select_executable "${1:-}" || exit 1
     echo ">>> 使用可执行文件: $EXE"
 
     # 2. 图标
@@ -138,6 +182,7 @@ EOF
     echo "    sudo usermod -aG dialout \$USER   # 然后重新登录"
 }
 
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 case "${1:-}" in
     -h|--help)
         sed -n '2,12p' "$0"
@@ -149,3 +194,4 @@ case "${1:-}" in
         install_app "$@"
         ;;
 esac
+fi
