@@ -218,11 +218,18 @@ class CanConfigurator(QObject):
                 self.finished.emit(False, f'自动{self._operation}需要系统 pkexec；请安装 polkit 后重试')
                 return
             installed = find_installed_helper()
-            if installed:
-                executable = installed
-                # The installed entry point accepts only CAN arguments. Never
-                # pass interpreter/frozen-GUI flags to its polkit authorization.
-                args = _request_arguments(*self._request, down=self._down)
+            if not installed:
+                self._request = None
+                self.finished.emit(
+                    False, 'CAN 授权助手未安装或权限不安全；请运行 sudo ./install.sh '
+                    '重新安装独立的 CAN 助手后重试')
+                return
+            # The GUI directory is writable by its ordinary user. Never elevate
+            # the executable or source helper from there, even with a password.
+            executable = installed
+            # The installed entry point accepts only CAN arguments. Never
+            # pass interpreter/frozen-GUI flags to its polkit authorization.
+            args = _request_arguments(*self._request, down=self._down)
             args = ['--disable-internal-agent', executable, *args]
             executable = pkexec
         self._job = _ProcessJob(executable, args, elevated, self._request[0])

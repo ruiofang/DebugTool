@@ -55,8 +55,8 @@ __author__ = AUTHOR
 def app_dir() -> str:
     """返回可执行文件 / 脚本所在目录（兼容 PyInstaller 冻结打包）。"""
     if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
+        return os.path.dirname(os.path.realpath(sys.executable))
+    return os.path.dirname(os.path.realpath(__file__))
 
 
 def app_icon_path() -> str:
@@ -67,18 +67,19 @@ def config_path() -> str:
     """返回配置文件路径。
 
     优先使用程序同目录下的 serial_tool.ini（便携模式）。
-    若该目录不可写（如安装到 /opt/qt5com 之类的系统目录），
-    则回退到用户配置目录：
+    安装器会将 /opt/qt5com 交给指定普通用户，优先在该目录保存。
+    若目录或已有配置文件不可写，则回退到用户配置目录：
         Linux/macOS:  ~/.config/qt5com/serial_tool.ini
         Windows:      %APPDATA%/qt5com/serial_tool.ini
     """
     portable = os.path.join(app_dir(), "serial_tool.ini")
-    # 同目录已有配置文件且可写 -> 沿用（便携模式）
+    # QSettings 原子保存还需要在父目录创建锁文件和临时文件。
     try:
-        if os.path.isfile(portable) and os.access(portable, os.W_OK):
-            return portable
-        if not os.path.exists(portable) and os.access(app_dir(), os.W_OK):
-            return portable
+        if os.access(app_dir(), os.W_OK | os.X_OK):
+            if os.path.isfile(portable) and os.access(portable, os.W_OK):
+                return portable
+            if not os.path.lexists(portable):
+                return portable
     except Exception:
         pass
 
@@ -138,6 +139,7 @@ from ssh_panel import SSHPanel
 from local_terminal import LocalTerminalPanel
 from network_panel import NetworkPanel
 from serial_terminal import SerialTerminalPanel
+from serial_access import describe_serial_open_error
 from async_log import AsyncLogWriter
 from can_panel import CanPanel
 
@@ -690,7 +692,6 @@ class DebugTool(QMainWindow):
         self.modbus_rx_buffer = bytearray()
         self.modbus_entries = []
         self.modbus_table_context = None
-        self.failed_ports = set()
         self.modbus_timeout = QTimer(self)
         self.modbus_timeout.setSingleShot(True)
         self.modbus_timeout.timeout.connect(self._on_modbus_timeout)
@@ -1476,8 +1477,6 @@ class DebugTool(QMainWindow):
         hidden = 0
         for p in ports:
             usable, reason = serial_port_usability(p)
-            if p.device in self.failed_ports:
-                usable, reason = False, "本次运行打开失败"
             if not usable and not self.chk_show_all_ports.isChecked():
                 hidden += 1
                 continue
@@ -1525,6 +1524,11 @@ class DebugTool(QMainWindow):
             self.close_port()
 
     def open_port(self):
+        # A repeated open request must not replace a live handle with a new
+        # connection that fails against our own exclusive lock.
+        if self.ser is not None and self.ser.is_open:
+            self.btn_open.setChecked(True)
+            return
         dev = self._current_port_device()
         if not dev:
             QMessageBox.warning(self, "提示", "未选择串口。")
@@ -1552,12 +1556,10 @@ class DebugTool(QMainWindow):
                 write_timeout=1,
             )
         except Exception as e:
-            self.failed_ports.add(dev)
-            self.refresh_ports()
-            QMessageBox.critical(
-                self, "打开失败",
-                f"无法打开 {dev}：{e}\n\n设备可能已被占用、刚刚断开，或当前用户没有串口权限。")
             self.btn_open.setChecked(False)
+            # Keep the attempted device selected. A transient lock failure
+            # must not hide it, select another port, or prevent a later retry.
+            self._show_serial_open_error(dev, e)
             return
 
         self.reader = SerialReader(self.ser)
@@ -1581,6 +1583,18 @@ class DebugTool(QMainWindow):
         # Finish terminal initialization before any first receive is delivered.
         self.reader.start()
         self.serial_receive_timer.start()
+
+    def _show_serial_open_error(self, device: str, error: Exception):
+        guidance, details = describe_serial_open_error(device, error)
+        dialog = QMessageBox(QMessageBox.Critical, "打开失败", guidance,
+                             QMessageBox.Ok, self)
+        dialog.setTextFormat(Qt.PlainText)
+        dialog.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        dialog.setDetailedText(details)
+        copy_button = dialog.addButton("复制诊断信息", QMessageBox.ActionRole)
+        copy_button.clicked.connect(
+            lambda: QApplication.clipboard().setText(guidance + "\n\n" + details))
+        dialog.exec_()
 
     def close_port(self):
         self.serial_receive_timer.stop()

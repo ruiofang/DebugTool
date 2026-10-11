@@ -107,7 +107,8 @@ class CanConfiguratorTests(unittest.TestCase):
 
     def setUp(self):
         # Tests never depend on or execute a host-installed privileged helper.
-        installed = patch('can_configurator.find_installed_helper', return_value=None)
+        installed = patch('can_configurator.find_installed_helper',
+                          return_value=str(gui.INSTALLED_HELPER))
         self.installed_helper = installed.start()
         self.addCleanup(installed.stop)
         self.runner = gui.CanConfigurator()
@@ -193,17 +194,28 @@ class CanConfiguratorTests(unittest.TestCase):
                 authorized.completed.emit(0, '')
                 self.assertEqual(self.results[-1], (True, 'CAN 接口已停用（DOWN）'))
 
-    def test_missing_or_untrusted_installation_preserves_authenticated_fallback(self):
+    def test_missing_or_untrusted_installation_never_elevates_writable_app(self):
+        self.installed_helper.return_value = None
         for frozen in (False, True):
-            with self.subTest(frozen=frozen), patch.object(sys, 'frozen', frozen, create=True), \
-                    patch('can_configurator._ProcessJob', FakeJob), \
-                    patch('can_configurator.find_pkexec', return_value='/usr/bin/pkexec'):
-                self.runner.start('can_qa', 500000)
-                ordinary = self.runner._job
-                fallback_args = ['--disable-internal-agent', ordinary.executable, *ordinary.args]
-                ordinary.completed.emit(gui.AUTH_REQUIRED, 'authorize')
-                self.assertEqual(self.runner._job.args, fallback_args)
-                self.runner._job.completed.emit(0, 'enabled')
+            for down in (False, True):
+                with self.subTest(frozen=frozen, down=down), \
+                        patch.object(sys, 'frozen', frozen, create=True), \
+                        patch('can_configurator._ProcessJob', side_effect=FakeJob) as jobs, \
+                        patch('can_configurator.find_pkexec', return_value='/usr/bin/pkexec'):
+                    self.results.clear()
+                    if down:
+                        self.runner.stop_interface('can_qa')
+                    else:
+                        self.runner.start('can_qa', 500000)
+                    ordinary = self.runner._job
+                    self.assertFalse(ordinary.elevated)
+                    ordinary.completed.emit(gui.AUTH_REQUIRED, 'authorize')
+                    self.assertEqual(jobs.call_count, 1)
+                    self.assertIsNone(self.runner._job)
+                    self.assertFalse(self.runner.running)
+                    self.assertEqual(len(self.results), 1)
+                    self.assertFalse(self.results[0][0])
+                    self.assertIn('sudo ./install.sh', self.results[0][1])
 
     def test_installed_helper_denial_and_cancel_do_not_claim_success(self):
         with patch('can_configurator._ProcessJob', FakeJob), \

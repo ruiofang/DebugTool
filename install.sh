@@ -7,7 +7,9 @@
 # 启动命令: DebugTool (兼容 qt5com)
 #
 # 用法:
-#   sudo ./install.sh             # 安装，默认配置本机活动桌面的 CAN 免密授权
+#   sudo ./install.sh             # 安装，为 sudo 调用者配置文件及串口权限
+#   sudo ./install.sh --user ruio # 为指定普通用户安装
+#   sudo ./install.sh --permissions-only # 仅修复现有安装的配置及串口权限
 #   sudo ./install.sh --uninstall # 卸载主程序，保留 CAN 助手和授权策略
 #
 set -e
@@ -29,6 +31,14 @@ CAN_POLICY="$CAN_POLICY_DIR/org.ruio.debugtool.configure-can.policy"
 CAN_PYTHON="/usr/bin/python3"
 CAN_PKEXEC=""
 CAN_IP=""
+INSTALL_USER=""
+INSTALL_UID=""
+INSTALL_GID=""
+INSTALL_HOME=""
+SERIAL_GROUP=""
+SERIAL_RULES_DIR="/etc/udev/rules.d"
+SERIAL_RULES="$SERIAL_RULES_DIR/70-debugtool-serial.rules"
+SERIAL_DEVICE_DIR="/dev"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
@@ -37,6 +47,196 @@ need_root() {
         echo "✘ 请使用 sudo 运行: sudo $0 $*"
         exit 1
     fi
+}
+
+resolve_install_user() {
+    local requested="${INSTALL_USER:-${SUDO_USER:-}}" record name password uid gid gecos user_home login_shell
+    if [[ -z "$requested" || "$requested" == root || "$requested" == -* ]]; then
+        echo "✘ 无法确定普通用户；请通过 sudo 运行，或指定 --user 用户名。" >&2
+        return 1
+    fi
+    record=$(getent passwd "$requested") || {
+        echo "✘ 用户不存在: $requested" >&2
+        return 1
+    }
+    IFS=: read -r name password uid gid gecos user_home login_shell <<< "$record"
+    if [[ "$name" != "$requested" || ! "$uid" =~ ^[0-9]+$ || "$uid" == 0 ||
+          ! "$gid" =~ ^[0-9]+$ || "$user_home" != /* ]]; then
+        echo "✘ 必须指定有有效主目录的普通用户: $requested" >&2
+        return 1
+    fi
+    INSTALL_USER="$name"
+    INSTALL_UID="$uid"
+    INSTALL_GID="$gid"
+    INSTALL_HOME="$user_home"
+}
+
+check_app_directory() {
+    # /opt is administrator-controlled; the application directory itself may
+    # belong to the intended desktop user. Never follow a replaced directory.
+    check_secure_directory_tree "$(dirname -- "$INSTALL_DIR")" || return 1
+    if [[ -L "$INSTALL_DIR" || ( -e "$INSTALL_DIR" && ! -d "$INSTALL_DIR" ) ]]; then
+        echo "✘ 安装目录不能是符号链接或非目录: $INSTALL_DIR" >&2
+        return 1
+    fi
+    if [[ -L "$INSTALL_DIR/serial_tool.ini" ||
+          ( -e "$INSTALL_DIR/serial_tool.ini" && ! -f "$INSTALL_DIR/serial_tool.ini" ) ]]; then
+        echo "✘ 配置文件不能是符号链接或非普通文件: $INSTALL_DIR/serial_tool.ini" >&2
+        return 1
+    fi
+}
+
+install_app_file() (
+    # Stage in the root-owned parent, then rename over the destination. A
+    # user-writable application directory must not turn root's install/chmod
+    # into writes through an existing symlink or hard link.
+    set -e
+    local source="$1" target="$2" mode="$3" staged_dir
+    check_app_directory || exit 1
+    staged_dir=$(mktemp -d "$(dirname -- "$INSTALL_DIR")/.qt5com-install.XXXXXX") || exit 1
+    trap 'rm -rf -- "$staged_dir"' EXIT
+    install -o root -g root -m "$mode" -- "$source" "$staged_dir/file"
+    mv -fT -- "$staged_dir/file" "$target"
+)
+
+configure_app_permissions() (
+    set -e
+    local source="" fallback="$INSTALL_HOME/.config/qt5com/serial_tool.ini" staged_dir
+    check_app_directory || exit 1
+    if [[ ! -x "$CAN_PYTHON" ]] || ! "$CAN_PYTHON" -I -S -c \
+            'import os, shutil, stat, sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)'; then
+        echo "✘ 安全迁移配置需要系统 Python 3.7+: $CAN_PYTHON" >&2
+        exit 1
+    fi
+    install -d -o "$INSTALL_UID" -g "$INSTALL_GID" -m 0755 -- "$INSTALL_DIR"
+    if [[ -f "$INSTALL_DIR/serial_tool.ini" ]]; then
+        source="$INSTALL_DIR/serial_tool.ini"
+    elif [[ -f "$fallback" && ! -L "$fallback" &&
+            ! -L "$INSTALL_HOME/.config" && ! -L "$INSTALL_HOME/.config/qt5com" ]]; then
+        source="$fallback"
+    fi
+    staged_dir=$(mktemp -d "$(dirname -- "$INSTALL_DIR")/.qt5com-config.XXXXXX") || exit 1
+    trap 'rm -rf -- "$staged_dir"' EXIT
+    if [[ -n "$source" ]]; then
+        # Open every component without following links: a user can rename their
+        # .config directory during a root install. Copy the bytes, never mutate
+        # the original inode or follow a link into another user's settings.
+        "$CAN_PYTHON" -I -S - "$source" "$staged_dir/serial_tool.ini" <<'PY'
+import os
+import shutil
+import stat
+import sys
+
+directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+try:
+    components = sys.argv[1].split("/")
+    for part in components[1:-1]:
+        if not part or part in (".", ".."):
+            raise ValueError("invalid configuration path")
+        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+        os.close(directory)
+        directory = child
+    source = os.open(components[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    with os.fdopen(source, "rb") as original:
+        metadata = os.fstat(original.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError("configuration must be a regular file without hard links")
+        with open(sys.argv[2], "xb") as staged:
+            shutil.copyfileobj(original, staged)
+finally:
+    os.close(directory)
+PY
+    else
+        : > "$staged_dir/serial_tool.ini"
+    fi
+    chown "$INSTALL_UID:$INSTALL_GID" "$staged_dir/serial_tool.ini"
+    chmod 0600 "$staged_dir/serial_tool.ini"
+    mv -fT -- "$staged_dir/serial_tool.ini" "$INSTALL_DIR/serial_tool.ini"
+    [[ "$source" != "$fallback" ]] || echo "✔ 已保留原用户配置到 $INSTALL_DIR/serial_tool.ini（原文件保留）。"
+    echo "✔ 配置目录: $INSTALL_DIR（$INSTALL_USER 所有，0755；配置文件仅该用户可读写）。"
+)
+
+check_serial_dependencies() {
+    command -v usermod >/dev/null 2>&1 || {
+        echo "✘ 配置串口权限需要 usermod。" >&2
+        return 1
+    }
+    if getent group dialout >/dev/null; then
+        SERIAL_GROUP=dialout
+    elif getent group uucp >/dev/null; then
+        SERIAL_GROUP=uucp
+    else
+        echo "✘ 未找到串口组 dialout 或 uucp，请先安装系统串口/udev 支持。" >&2
+        return 1
+    fi
+    command -v udevadm >/dev/null 2>&1 || {
+        echo "✘ 配置串口权限需要 udevadm，请先安装系统 udev。" >&2
+        return 1
+    }
+    check_secure_file_target "$SERIAL_RULES" || return 1
+}
+
+install_serial_permissions() (
+    set -e
+    local staged_dir device basename permissions_pending=0
+    local -a serial_devices=()
+    ensure_secure_directory "$SERIAL_RULES_DIR"
+    staged_dir=$(mktemp -d "$SERIAL_RULES_DIR/.debugtool-serial.XXXXXX") || exit 1
+    trap 'rm -rf -- "$staged_dir"' EXIT
+    # Run before systemd's 73-seat-late.rules so uaccess reaches active seats.
+    # Limit this rule to actual serial names; never grant access to tty/console/pts.
+    {
+        echo '# DebugTool: serial group plus active-local-session access.'
+        for basename in ttyUSB ttyACM ttyS ttyAMA ttyTHS ttymxc; do
+            printf 'SUBSYSTEM=="tty", KERNEL=="%s[0-9]*", GROUP="%s", MODE="0660", TAG+="uaccess"\n' \
+                "$basename" "$SERIAL_GROUP"
+        done
+    } > "$staged_dir/rules"
+    install_can_file "$staged_dir/rules" "$SERIAL_RULES" 0644
+    usermod -a -G "$SERIAL_GROUP" -- "$INSTALL_USER"
+    udevadm control --reload-rules
+    for device in "$SERIAL_DEVICE_DIR"/ttyUSB* "$SERIAL_DEVICE_DIR"/ttyACM* \
+                  "$SERIAL_DEVICE_DIR"/ttyS* "$SERIAL_DEVICE_DIR"/ttyAMA* \
+                  "$SERIAL_DEVICE_DIR"/ttyTHS* "$SERIAL_DEVICE_DIR"/ttymxc*; do
+        basename=${device##*/}
+        [[ "$basename" =~ ^(ttyUSB|ttyACM|ttyS|ttyAMA|ttyTHS|ttymxc)[0-9]+$ ]] || continue
+        [[ -c "$device" && ! -L "$device" ]] || continue
+        serial_devices+=("$device")
+        # Reapply only matching serial rules; no serial open, I/O or process kill.
+        udevadm trigger --action=change --subsystem-match=tty --sysname-match="$basename" || permissions_pending=1
+    done
+    # uaccess can rewrite ACLs asynchronously; set the selected user's ACL only
+    # after all change events have completed.
+    udevadm settle --timeout=5 || permissions_pending=1
+    for device in "${serial_devices[@]}"; do
+        [[ -c "$device" && ! -L "$device" ]] || continue
+        # A precise ACL also serves an already-running session whose group list
+        # predates usermod. ACL absence/failure is recoverable by logging in again.
+        if command -v setfacl >/dev/null 2>&1; then
+            setfacl -m "u:$INSTALL_UID:rw" -- "$device" || permissions_pending=1
+        else
+            permissions_pending=1
+        fi
+    done
+    echo "✔ 串口权限: $INSTALL_USER 已加入 $SERIAL_GROUP；已安装持续生效的 udev 规则。"
+    if (( permissions_pending )); then
+        echo "   当前会话权限若未生效，请注销并重新登录，再重新插拔串口设备。"
+    fi
+    echo "   其他程序独占串口产生的 Errno 11 需要先关闭占用程序；权限修复不会抢占设备。"
+)
+
+repair_permissions() {
+    need_root
+    resolve_install_user || return 1
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        echo "✘ 尚未安装 $INSTALL_DIR，请先执行完整安装。" >&2
+        return 1
+    fi
+    check_app_directory || return 1
+    check_serial_dependencies || return 1
+    configure_app_permissions
+    install_serial_permissions
+    echo "✔ 已修复安装权限；请以普通用户 $INSTALL_USER 重新打开 DebugTool。"
 }
 
 check_secure_directory_tree() {
@@ -270,6 +470,9 @@ install_app() {
     # Fail before changing the installed application if CAN authorization cannot
     # be installed. Normal launches never change system permissions themselves.
     check_can_dependencies || exit 1
+    resolve_install_user || exit 1
+    check_app_directory || exit 1
+    check_serial_dependencies || exit 1
 
     # 2. 图标
     ICON_SRC=""
@@ -279,18 +482,16 @@ install_app() {
 
     # 3. 安装
     echo ">>> 安装到 $INSTALL_DIR ..."
-    mkdir -p "$INSTALL_DIR"
-    install -m 0755 "$EXE" "$INSTALL_DIR/DebugTool"
+    configure_app_permissions
+    install_app_file "$EXE" "$INSTALL_DIR/DebugTool" 0755
     if [[ -n "$ICON_SRC" ]]; then
-        install -m 0644 "$ICON_SRC" "$INSTALL_DIR/app.png"
+        install_app_file "$ICON_SRC" "$INSTALL_DIR/app.png" 0644
         install -m 0644 "$ICON_SRC" "$ICON_DEST"
         # XFCE and other Freedesktop desktops resolve Icon= names through the
         # active icon theme. /usr/share/pixmaps alone is not reliable there.
         mkdir -p "$(dirname "$THEME_ICON_DEST")"
         install -m 0644 "$ICON_SRC" "$THEME_ICON_DEST"
     fi
-    # 保持系统安装目录只允许管理员写入，普通用户配置自动回退到用户目录。
-    chmod 0755 "$INSTALL_DIR"
 
     # 4. /usr/local/bin 软链接
     ln -sf "$INSTALL_DIR/DebugTool" "$BIN_LINK"
@@ -322,27 +523,60 @@ EOF
     # 7. Dedicated CAN-only authorization, independent of the GUI installation.
     install_can_permissions
 
-    # 8. 确保 dialout 组提示
+    # 8. 安装时配置串口组、设备热插拔权限和当前设备 ACL。
+    install_serial_permissions
     echo
     echo "✔ 安装完成!"
     echo "   启动:   DebugTool  (或在应用菜单中点击 \"$APP_NAME\")"
     echo "   卸载:   sudo $0 --uninstall"
     echo "   CAN:    本机活动桌面用户可免密配置比特率及 UP/DOWN；卸载保留此授权。"
+    echo "   配置:   $INSTALL_DIR/serial_tool.ini（请以普通用户 $INSTALL_USER 启动）。"
     echo
-    echo "Tips: 如果打开串口提示权限不足，请执行:"
-    echo "    sudo usermod -aG dialout \$USER   # 然后重新登录"
+}
+
+main() {
+    local mode=install executable=""
+    while (( $# )); do
+        case "$1" in
+            -h|--help)
+                echo "用法: sudo $0 [--user 用户名] [可执行文件]"
+                echo "      sudo $0 [--user 用户名] --permissions-only"
+                echo "      sudo $0 --uninstall"
+                echo "默认用户为 SUDO_USER；root 直接运行时须指定 --user。"
+                return 0 ;;
+            --user)
+                if (( $# < 2 )) || [[ -z "$2" || "$2" == -* ]]; then
+                    echo "✘ --user 需要普通用户名。" >&2
+                    return 1
+                fi
+                INSTALL_USER="$2"
+                shift 2 ;;
+            --permissions-only)
+                [[ "$mode" == install ]] || { echo "✘ 操作参数冲突。" >&2; return 1; }
+                mode=permissions
+                shift ;;
+            --uninstall|-u)
+                [[ "$mode" == install ]] || { echo "✘ 操作参数冲突。" >&2; return 1; }
+                mode=uninstall
+                shift ;;
+            -*) echo "✘ 未知参数: $1" >&2; return 1 ;;
+            *)
+                [[ -z "$executable" ]] || { echo "✘ 只能指定一个可执行文件。" >&2; return 1; }
+                executable="$1"
+                shift ;;
+        esac
+    done
+    if [[ "$mode" != install && -n "$executable" ]]; then
+        echo "✘ 此操作不能同时指定可执行文件。" >&2
+        return 1
+    fi
+    case "$mode" in
+        install) install_app "$executable" ;;
+        permissions) repair_permissions ;;
+        uninstall) uninstall ;;
+    esac
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-case "${1:-}" in
-    -h|--help)
-        sed -n '2,12p' "$0"
-        ;;
-    --uninstall|-u)
-        uninstall
-        ;;
-    *)
-        install_app "$@"
-        ;;
-esac
+    main "$@"
 fi

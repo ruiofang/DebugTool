@@ -213,9 +213,14 @@ vi 使用提示：先按 `i` / `a` 进入插入模式再输入、退格，`Esc` 
 回归测试：`python3 -m unittest discover -s tests -v`（含无显示环境下的 Qt 界面测试）。
 
 ### Linux 权限
+
+安装脚本会为指定普通用户配置串口用户组和 USB / 板载串口的 udev 访问规则（`/etc/udev/rules.d/70-debugtool-serial.rules`）；已连接设备在系统提供 `setfacl` 时立即授权。用户组变更需注销并重新登录后完整生效，也可重新插拔 USB 串口让桌面会话授权生效。卸载主程序会保留这些串口授权。
+
 ```bash
-sudo usermod -aG dialout $USER     # 重新登录生效
+sudo ./install.sh --permissions-only  # 仅修复已安装程序的配置目录和串口权限
 ```
+
+`Errno 11 / Could not exclusively lock port` 表示端口独占锁冲突，应先关闭其他窗口、ESP-IDF Monitor 等程序对该端口的连接。ESP-IDF Monitor 可在它自己的终端按 `Ctrl+]` 退出。可用 `fuser -v /dev/ttyACM2` 查看占用进程（设备名按实际选择替换）；修改文件权限无法解除占用。DebugTool 打开失败后会保留选中的端口，释放占用后可直接重试；错误对话框提供详细信息和复制诊断信息按钮。
 
 ### 打包为单文件可执行程序
 
@@ -250,14 +255,20 @@ python3 build.py --clean             # 清理构建产物，保留 VERSION
 ### 安装到系统（Linux）
 
 ```bash
-sudo ./install.sh                 # 安装程序、桌面入口和默认 CAN 免密授权
-sudo ./install.sh --uninstall     # 卸载主程序和用户配置，保留 CAN 助手及授权
+sudo ./install.sh                    # 安装程序、串口权限和默认 CAN 免密授权
+sudo ./install.sh --user ruio        # 显式指定使用程序的普通用户
+sudo ./install.sh --permissions-only # 仅修复配置目录和串口权限，不替换程序
+sudo ./install.sh --uninstall        # 卸载主程序和用户配置，保留 CAN 助手及授权
 ```
 默认安装 `VERSION` 对应的 Linux 产物，尚未打包该版本时会明确报错。也可用 `sudo ./install.sh /path/to/DebugTool` 指定已有程序；没有 `VERSION` 时按版本号选择最新产物。使用新 CAN 授权入口需要先用更新后的源码重新打包，再安装。
+
+安装目录 `/opt/qt5com` 归调用 `sudo` 的普通用户（或 `--user` 指定的用户）所有，权限为 `0755`，该用户可直接保存配置。直接以 root 执行时需用 `--user` 指定普通用户。升级保留已有 `serial_tool.ini` 并修复其属主；安装目录没有配置时，迁移该用户原先 `~/.config/qt5com/serial_tool.ini`，保留原文件。不要用 `sudo DebugTool` 启动界面。
 
 安装器需要系统 Python 3.7+（固定 `/usr/bin/python3`）、`iproute2`、polkit / `pkexec`。专用助手只使用 Python 标准库；缺少依赖或安装路径权限不安全时，会在修改已安装程序前明确报错。分发安装包时须附带 `install.sh`、同目录的 `can_config.py` 和可执行产物；安装过程不会启停真实 CAN 接口。
 
 CAN 助手独立安装到 `/usr/local/libexec/debugtool/`，其中 `can-config` 为固定入口，`can_config.py` 负责参数和接口校验；专属策略为 `/usr/share/polkit-1/actions/org.ruio.debugtool.configure-can.policy`。这些文件及目录由 root 管理，普通用户不可写，助手以隔离的系统 Python 运行。本机当前活动桌面会话默认免密，其他会话保留管理员认证，具体范围遵循 [polkit 会话授权规则](https://polkit.pages.freedesktop.org/polkit/polkit.8.html)。重复安装会更新助手和策略。
+
+需要提权时仅调用通过权限检查的独立 CAN 助手；助手缺失或权限异常会提示重新安装，不通过用户可写的主程序目录执行管理员操作。
 
 **卸载主程序会保留上述 CAN 助手和授权策略**，助手不依赖 `/opt/qt5com`，下次安装可继续使用。
 
@@ -269,7 +280,7 @@ CAN 助手独立安装到 `/usr/local/libexec/debugtool/`，其中 `can-config` 
   - 同时按 Freedesktop 图标主题规范安装到 `/usr/share/icons/hicolor/256x256/apps/qt5com.png` 并刷新缓存，兼容 XFCE、GNOME、KDE 等桌面菜单。GNOME 通过 `qt5com.desktop` 和 `StartupWMClass` 将菜单、Dock 与运行窗口归为同一应用。
 - 配置文件：
   - 便携模式（程序所在目录可写时）：`<程序目录>/serial_tool.ini`
-  - 系统安装（`/opt/qt5com`）普通用户不可写，配置会回退到用户目录。
+  - 系统安装：指定普通用户优先使用 `/opt/qt5com/serial_tool.ini`，通过 `DebugTool` / `qt5com` 软链接启动也使用此路径。
   - 若安装目录不可写，则自动回退到用户目录：
     - Linux/macOS：`~/.config/qt5com/serial_tool.ini`
     - Windows：`%APPDATA%\qt5com\serial_tool.ini`

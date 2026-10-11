@@ -40,10 +40,25 @@ DESKTOP_FILE="$TEST_ROOT/usr/share/applications/qt5com.desktop"
 ICON_DEST="$TEST_ROOT/usr/share/pixmaps/qt5com.png"
 THEME_ICON_DEST="$TEST_ROOT/usr/share/icons/hicolor/256x256/apps/qt5com.png"
 ICON_THEME_DIR="$TEST_ROOT/usr/share/icons/hicolor"
-SUDO_USER=''
+SERIAL_RULES_DIR="$TEST_ROOT/etc/udev/rules.d"
+SERIAL_RULES="$SERIAL_RULES_DIR/70-debugtool-serial.rules"
+SERIAL_DEVICE_DIR="$TEST_ROOT/dev"
+SUDO_USER='testuser'
 
 need_root() { :; }
-getent() { return 1; }
+getent() {
+    case "$*" in
+        'passwd testuser') printf 'testuser:x:1234:4321::%s/home/testuser:/bin/bash\n' "$TEST_ROOT" ;;
+        'group dialout') printf 'dialout:x:20:\n' ;;
+        *) return 1 ;;
+    esac
+}
+usermod() { printf '%s\n' "usermod $*" >> "$TEST_ROOT/mutations.log"; }
+udevadm() { printf '%s\n' "udevadm $*" >> "$TEST_ROOT/mutations.log"; }
+setfacl() {
+    test_destination "${!#}" || return
+    printf '%s\n' "setfacl $*" >> "$TEST_ROOT/mutations.log"
+}
 update-desktop-database() { :; }
 gtk-update-icon-cache() { :; }
 
