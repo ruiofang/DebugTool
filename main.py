@@ -819,6 +819,11 @@ class DebugTool(QMainWindow):
         hist_row = QHBoxLayout()
         self.cmb_history = QComboBox()
         self.cmb_history.setEditable(False)
+        # Restored long commands must not become the right pane's minimum
+        # width and leave no room to drag the horizontal splitter.
+        self.cmb_history.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_history.setMinimumContentsLength(12)
         self.cmb_history.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.cmb_history.activated.connect(self.on_history_selected)
         self.btn_history_delete = QToolButton()
