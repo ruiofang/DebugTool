@@ -651,6 +651,8 @@ class SerialReader(QThread):
 # ------------------------------------------------------------------ #
 class DebugTool(QMainWindow):
     CAN_MODE = 4
+    (QUICK_COL_LOOP, QUICK_COL_NAME, QUICK_COL_CONTENT,
+     QUICK_COL_HEX, QUICK_COL_NEWLINE, QUICK_COL_SEND) = range(6)
     COMMON_BAUDS = ["1200", "2400", "4800", "9600", "19200", "38400",
                     "57600", "115200", "230400", "460800", "921600"]
     DATA_BITS = ["8", "7", "6", "5"]
@@ -701,6 +703,17 @@ class DebugTool(QMainWindow):
         # 配置文件：优先程序同目录（便携），不可写时自动回退到用户目录
         self._config_path = config_path()
         self.settings = QSettings(self._config_path, QSettings.IniFormat)
+
+        self.quick_loop_timer = QTimer(self)
+        self.quick_loop_timer.setSingleShot(True)
+        self.quick_loop_timer.setTimerType(Qt.PreciseTimer)
+        self.quick_loop_timer.timeout.connect(self._send_next_quick)
+        self._quick_loop_running = False
+        self._quick_loop_commands = []
+        self._quick_loop_index = 0
+        self._quick_loop_round = 0
+        self._quick_loop_sent = 0
+        self._quick_loop_round_limit = 0
 
         self._build_ui()
         self._apply_style()
@@ -991,6 +1004,7 @@ class DebugTool(QMainWindow):
                 right_split.setSizes(normal_split_sizes)
                 normal_split_sizes.clear()
             if tab.widget(index) is self.serial_terminal:
+                self._stop_quick_loop()
                 self.chk_auto_send.setChecked(False)
                 self.chk_auto_reply.setChecked(False)
                 self.chk_modbus_poll.setChecked(False)
@@ -1034,6 +1048,7 @@ class DebugTool(QMainWindow):
         self.network_panel.sent.connect(self._on_network_sent)
         self.network_panel.status_changed.connect(self._on_network_status)
         self.network_panel.stop_sending.connect(lambda: self.chk_auto_send.setChecked(False))
+        self.network_panel.stop_sending.connect(self._stop_quick_loop)
         self.can_panel.received.connect(self._on_can_received)
         self.can_panel.sent.connect(self._on_can_sent)
         self.can_panel.status_changed.connect(self._on_can_status)
@@ -1230,27 +1245,54 @@ class DebugTool(QMainWindow):
         w = QWidget()
         v = QVBoxLayout(w)
 
-        self.quick_table = QTableWidget(0, 5)
+        loop_row = QHBoxLayout()
+        self.chk_quick_loop = QCheckBox("定时循环发送")
+        self.chk_quick_loop.setToolTip("按表格顺序发送勾选的指令；勾选后立即发送第一条。")
+        self.spn_quick_interval = QSpinBox()
+        self.spn_quick_interval.setRange(10, 600000)
+        self.spn_quick_interval.setValue(1000)
+        self.spn_quick_interval.setSuffix(" ms")
+        self.spn_quick_interval.setToolTip("每条指令发送后的等待时间，下一轮也使用此间隔。")
+        self.spn_quick_rounds = QSpinBox()
+        self.spn_quick_rounds.setRange(0, 1000000)
+        self.spn_quick_rounds.setValue(1)
+        self.spn_quick_rounds.setSpecialValueText("无限")
+        self.spn_quick_rounds.setToolTip("全部勾选的指令发送一遍为一轮；0 表示无限循环。")
+        self.btn_quick_stop = QPushButton("停止")
+        self.btn_quick_stop.setEnabled(False)
+        self.chk_quick_loop.toggled.connect(self._toggle_quick_loop)
+        self.btn_quick_stop.clicked.connect(lambda: self._stop_quick_loop())
+        loop_row.addWidget(self.chk_quick_loop)
+        loop_row.addWidget(QLabel("间隔:"))
+        loop_row.addWidget(self.spn_quick_interval)
+        loop_row.addWidget(QLabel("循环次数:"))
+        loop_row.addWidget(self.spn_quick_rounds)
+        loop_row.addWidget(self.btn_quick_stop)
+        loop_row.addStretch()
+        v.addLayout(loop_row)
+        self.lbl_quick_loop_status = QLabel("勾选要循环的指令，每组发送一遍计为一轮。")
+        self.lbl_quick_loop_status.setWordWrap(True)
+        v.addWidget(self.lbl_quick_loop_status)
+
+        self.quick_table = QTableWidget(0, 6)
         self.quick_table.setHorizontalHeaderLabels(
-            ["名称", "内容", "HEX", "附加\\r\\n", "发送"])
+            ["循环", "名称", "内容", "HEX", "附加\\r\\n", "发送"])
         hh = self.quick_table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.Stretch)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        for column in range(6):
+            hh.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.QUICK_COL_CONTENT, QHeaderView.Stretch)
         self.quick_table.verticalHeader().setDefaultSectionSize(28)
         self.quick_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         v.addWidget(self.quick_table)
 
         row = QHBoxLayout()
-        btn_add = QPushButton("添加按钮")
-        btn_del = QPushButton("删除所选")
-        btn_add.clicked.connect(lambda: self._add_quick_row("新指令", "", False, False))
-        btn_del.clicked.connect(self._del_quick_rows)
+        self.btn_quick_add = QPushButton("添加按钮")
+        self.btn_quick_delete = QPushButton("删除所选")
+        self.btn_quick_add.clicked.connect(lambda: self._add_quick_row("新指令", "", False, False))
+        self.btn_quick_delete.clicked.connect(self._del_quick_rows)
         row.addStretch()
-        row.addWidget(btn_add)
-        row.addWidget(btn_del)
+        row.addWidget(self.btn_quick_add)
+        row.addWidget(self.btn_quick_delete)
         v.addLayout(row)
         return w
 
@@ -1386,16 +1428,70 @@ class DebugTool(QMainWindow):
     def _cell_checkbox(self, widget: QWidget) -> QCheckBox | None:
         return getattr(widget, "checkbox", None) if widget else None
 
-    def _add_quick_row(self, name: str, content: str, is_hex: bool, newline: bool):
+    def _add_quick_row(self, name: str, content: str, is_hex: bool, newline: bool,
+                       loop_enabled: bool = False):
         r = self.quick_table.rowCount()
         self.quick_table.insertRow(r)
-        self.quick_table.setItem(r, 0, QTableWidgetItem(name))
-        self.quick_table.setItem(r, 1, QTableWidgetItem(content))
-        self.quick_table.setCellWidget(r, 2, self._make_center_checkbox(is_hex))
-        self.quick_table.setCellWidget(r, 3, self._make_center_checkbox(newline))
+        self.quick_table.setCellWidget(r, self.QUICK_COL_LOOP, self._make_center_checkbox(loop_enabled))
+        self.quick_table.setItem(r, self.QUICK_COL_NAME, QTableWidgetItem(name))
+        self.quick_table.setItem(r, self.QUICK_COL_CONTENT, QTableWidgetItem(content))
+        self.quick_table.setCellWidget(r, self.QUICK_COL_HEX, self._make_center_checkbox(is_hex))
+        self.quick_table.setCellWidget(r, self.QUICK_COL_NEWLINE, self._make_center_checkbox(newline))
         btn = QPushButton("发送")
         btn.clicked.connect(lambda _=False, b=btn: self._send_quick_row(b))
-        self.quick_table.setCellWidget(r, 4, btn)
+        self.quick_table.setCellWidget(r, self.QUICK_COL_SEND, btn)
+
+    def _prepare_quick_command(self, row: int, strict_hex: bool = False):
+        item = self.quick_table.item(row, self.QUICK_COL_CONTENT)
+        text = item.text() if item else ""
+        if not text:
+            raise ValueError(f"第 {row + 1} 行发送内容为空")
+        name_item = self.quick_table.item(row, self.QUICK_COL_NAME)
+        name = name_item.text() if name_item else ""
+        hex_cb = self._cell_checkbox(self.quick_table.cellWidget(row, self.QUICK_COL_HEX))
+        nl_cb = self._cell_checkbox(self.quick_table.cellWidget(row, self.QUICK_COL_NEWLINE))
+        is_hex = bool(hex_cb and hex_cb.isChecked())
+        if is_hex and strict_hex:
+            compact = re.sub(r"\s", "", text)
+            if not compact or len(compact) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", compact):
+                raise ValueError(f"第 {row + 1} 行 HEX 格式无效，请填写完整字节，例如 AA 55")
+        data = hex_str_to_bytes(text) if is_hex else text.encode("utf-8")
+        if nl_cb and nl_cb.isChecked() and not is_hex:
+            data += b"\r\n"
+        if not data:
+            raise ValueError(f"第 {row + 1} 行发送内容为空")
+        data = self._maybe_append_checksum(data)
+        if strict_hex and self.transport_mode.currentIndex() in (1, 2, 3) and len(data) > 65507:
+            raise ValueError(f"第 {row + 1} 行超过网络单次发送上限 65507 字节")
+        return {"name": name, "text": text, "hex": is_hex, "data": data}
+
+    def _send_quick_payload(self, command) -> bool:
+        data = command["data"]
+        try:
+            if self.transport_mode.currentIndex() in (1, 2, 3):
+                success = self.network_panel.send_bytes(data)
+                if success:
+                    self._push_history(command["text"])
+                return success
+            if self.transport_mode.currentIndex() != 0 or not (self.ser and self.ser.is_open):
+                raise IOError("请先打开串口")
+            written = self.ser.write(data)
+            self.tx_bytes += written
+            self._update_counter()
+            if written != len(data):
+                raise IOError(f"仅发送 {written}/{len(data)} 字节，请检查设备")
+        except Exception as e:
+            self.chk_auto_send.setChecked(False)
+            self.append_log(f"[快捷发送失败] {e}", color="#c0392b")
+            return False
+        text, name = command["text"], command["name"]
+        shown = bytes_to_hex_str(data) if command["hex"] else text
+        ts = f"[{now_ms()}] " if self.chk_show_time.isChecked() else ""
+        self.append_log(f"{ts}>> [{name}] {shown}", color="#0d47a1")
+        self._write_log_raw(
+            f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} "
+            f"TX[{name}] -> {shown}\n")
+        return True
 
     def _send_quick_row(self, btn: QPushButton):
         if self.transport_mode.currentIndex() == self.CAN_MODE:
@@ -1403,48 +1499,110 @@ class DebugTool(QMainWindow):
             return
         # 通过按钮定位所在行
         for r in range(self.quick_table.rowCount()):
-            if self.quick_table.cellWidget(r, 4) is btn:
+            if self.quick_table.cellWidget(r, self.QUICK_COL_SEND) is btn:
                 break
         else:
             return
         if self.transport_mode.currentIndex() == 0 and not (self.ser and self.ser.is_open):
             QMessageBox.information(self, "提示", "请先打开串口。")
             return
-        content_item = self.quick_table.item(r, 1)
-        if not content_item:
-            return
-        text = content_item.text()
-        if not text:
-            return
-        hex_cb = self._cell_checkbox(self.quick_table.cellWidget(r, 2))
-        nl_cb = self._cell_checkbox(self.quick_table.cellWidget(r, 3))
-        is_hex = bool(hex_cb and hex_cb.isChecked())
-        add_nl = bool(nl_cb and nl_cb.isChecked())
         try:
-            data = hex_str_to_bytes(text) if is_hex else text.encode("utf-8")
-            if add_nl and not is_hex:
-                data += b"\r\n"
-            data = self._maybe_append_checksum(data)
-            if self.transport_mode.currentIndex() != 0:
-                if self.network_panel.send_bytes(data):
-                    self._push_history(text)
-                return
-            self.ser.write(data)
+            command = self._prepare_quick_command(r)
         except Exception as e:
-            self.chk_auto_send.setChecked(False)
             self.append_log(f"[快捷发送失败] {e}", color="#c0392b")
             return
-        self.tx_bytes += len(data)
-        self._update_counter()
-        shown = bytes_to_hex_str(data) if is_hex else text
-        ts = f"[{now_ms()}] " if self.chk_show_time.isChecked() else ""
-        name = (self.quick_table.item(r, 0).text() if self.quick_table.item(r, 0) else "")
-        self.append_log(f"{ts}>> [{name}] {shown}", color="#0d47a1")
-        self._write_log_raw(
-            f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} "
-            f"TX[{name}] -> {shown}\n")
+        self._stop_quick_loop()
+        self._send_quick_payload(command)
+
+    def _set_quick_loop_controls(self, running: bool):
+        for widget in (self.quick_table, self.btn_quick_add, self.btn_quick_delete,
+                       self.spn_quick_interval, self.spn_quick_rounds):
+            widget.setEnabled(not running)
+        self.btn_quick_stop.setEnabled(running)
+        # Keep the selected network destination stable during a sequence.
+        if running:
+            for widget in (self.network_panel.remote_host, self.network_panel.remote_port,
+                           self.network_panel.clients, self.network_panel.drop_button):
+                widget.setEnabled(False)
+        else:
+            self.network_panel.update_controls()
+            self.network_panel.clients.setEnabled(True)
+            self.network_panel.drop_button.setEnabled(True)
+
+    def _quick_loop_progress(self, message: str):
+        target = str(self._quick_loop_round_limit) if self._quick_loop_round_limit else "无限"
+        self.lbl_quick_loop_status.setText(
+            f"{message}：已完成 {self._quick_loop_round}/{target} 轮，已发送 {self._quick_loop_sent} 条")
+
+    def _toggle_quick_loop(self, enabled: bool):
+        if not enabled:
+            self._stop_quick_loop()
+            return
+        try:
+            if self.transport_mode.currentIndex() == self.CAN_MODE:
+                raise ValueError("CAN 请使用发送页的循环发送")
+            if self.transport_mode.currentIndex() == 0 and not (self.ser and self.ser.is_open):
+                raise ValueError("请先打开串口")
+            if self.transport_mode.currentIndex() in (1, 2, 3) and not self.network_panel.active:
+                raise ValueError("请先连接或开始监听")
+            commands = []
+            for row in range(self.quick_table.rowCount()):
+                cb = self._cell_checkbox(self.quick_table.cellWidget(row, self.QUICK_COL_LOOP))
+                if cb and cb.isChecked():
+                    commands.append(self._prepare_quick_command(row, strict_hex=True))
+            if not commands:
+                raise ValueError("请先勾选要循环发送的指令")
+        except Exception as exc:
+            self._stop_quick_loop("未启动")
+            self.lbl_quick_loop_status.setText(f"未启动：{exc}")
+            return
+        self.chk_auto_send.setChecked(False)
+        self.chk_modbus_poll.setChecked(False)
+        self._quick_loop_commands = commands
+        self._quick_loop_index = self._quick_loop_round = self._quick_loop_sent = 0
+        self._quick_loop_round_limit = self.spn_quick_rounds.value()
+        self._quick_loop_interval = self.spn_quick_interval.value()
+        self._quick_loop_running = True
+        self._set_quick_loop_controls(True)
+        self._send_next_quick()
+
+    def _send_next_quick(self):
+        if not self._quick_loop_running:
+            return
+        command = self._quick_loop_commands[self._quick_loop_index]
+        success = self._send_quick_payload(command)
+        if not success:
+            self._stop_quick_loop("发送失败，循环已停止")
+            return
+        # A network stop signal can arrive synchronously during send_bytes.
+        if not self._quick_loop_running:
+            return
+        self._quick_loop_sent += 1
+        self._quick_loop_index += 1
+        if self._quick_loop_index == len(self._quick_loop_commands):
+            self._quick_loop_index = 0
+            self._quick_loop_round += 1
+        if self._quick_loop_round_limit and self._quick_loop_round >= self._quick_loop_round_limit:
+            self._stop_quick_loop("已完成")
+            return
+        self._quick_loop_progress("循环中")
+        self.quick_loop_timer.start(self._quick_loop_interval)
+
+    def _stop_quick_loop(self, message=None):
+        if not self._quick_loop_running and not self.chk_quick_loop.isChecked() and message is None:
+            return
+        self.quick_loop_timer.stop()
+        self._quick_loop_running = False
+        self._quick_loop_commands = []
+        blocked = self.chk_quick_loop.blockSignals(True)
+        self.chk_quick_loop.setChecked(False)
+        self.chk_quick_loop.blockSignals(blocked)
+        self._set_quick_loop_controls(False)
+        self._quick_loop_progress(message or "已停止")
 
     def _del_quick_rows(self):
+        if self._quick_loop_running:
+            return
         rows = sorted({i.row() for i in self.quick_table.selectedIndexes()}, reverse=True)
         for r in rows:
             self.quick_table.removeRow(r)
@@ -1602,6 +1760,7 @@ class DebugTool(QMainWindow):
         dialog.exec_()
 
     def close_port(self):
+        self._stop_quick_loop()
         self.serial_receive_timer.stop()
         self.chk_modbus_poll.setChecked(False)
         self.modbus_timeout.stop()
@@ -1706,6 +1865,7 @@ class DebugTool(QMainWindow):
     #  接收
     # -------------------------------------------------------------- #
     def _on_transport_changed(self, index):
+        self._stop_quick_loop()
         self.chk_auto_send.setChecked(False)
         if index != 0:
             self.chk_auto_reply.setChecked(False)
@@ -1951,6 +2111,7 @@ class DebugTool(QMainWindow):
     #  发送
     # -------------------------------------------------------------- #
     def on_send_clicked(self):
+        self._stop_quick_loop()
         if self.transport_mode.currentIndex() == self.CAN_MODE:
             text = self.send_edit.toPlainText()
             if self.can_panel.send_text(text):
@@ -1992,6 +2153,7 @@ class DebugTool(QMainWindow):
 
     def toggle_auto_send(self, on: bool):
         if on:
+            self._stop_quick_loop()
             self.auto_send_timer.start(self.spn_interval.value())
         else:
             self.auto_send_timer.stop()
@@ -2222,6 +2384,7 @@ class DebugTool(QMainWindow):
                 self.chk_modbus_poll.setChecked(False)
                 self.modbus_result.setPlainText("自动读取需要先打开串口并选择读功能码。")
                 return
+            self._stop_quick_loop()
             self.modbus_poll_timer.start(self.spn_modbus_scan.value())
             self._poll_modbus()
         else:
@@ -2591,6 +2754,8 @@ class DebugTool(QMainWindow):
         self.cmb_theme.blockSignals(False)
 
         self.spn_interval.setValue(int(s.value("auto_interval", 1000)))
+        self.spn_quick_interval.setValue(s.value("quick_loop_interval", 1000, type=int))
+        self.spn_quick_rounds.setValue(s.value("quick_loop_rounds", 1, type=int))
 
         self.chk_auto_reply.setChecked(s.value("auto_reply", False, type=bool))
         self.chk_reply_hex_match.setChecked(s.value("reply_hex_match", False, type=bool))
@@ -2644,6 +2809,7 @@ class DebugTool(QMainWindow):
                 q.get("content", ""),
                 bool(q.get("hex", False)),
                 bool(q.get("newline", False)),
+                bool(q.get("loop", False)),
             )
 
         last_send = s.value("last_send", "")
@@ -2674,6 +2840,8 @@ class DebugTool(QMainWindow):
         s.setValue("show_all_ports", self.chk_show_all_ports.isChecked())
 
         s.setValue("auto_interval", self.spn_interval.value())
+        s.setValue("quick_loop_interval", self.spn_quick_interval.value())
+        s.setValue("quick_loop_rounds", self.spn_quick_rounds.value())
         s.setValue("auto_reply", self.chk_auto_reply.isChecked())
         s.setValue("reply_hex_match", self.chk_reply_hex_match.isChecked())
         s.setValue("reply_hex_send", self.chk_reply_hex_send.isChecked())
@@ -2701,15 +2869,17 @@ class DebugTool(QMainWindow):
 
         quicks = []
         for r in range(self.quick_table.rowCount()):
-            name_item = self.quick_table.item(r, 0)
-            cont_item = self.quick_table.item(r, 1)
-            hex_cb = self._cell_checkbox(self.quick_table.cellWidget(r, 2))
-            nl_cb = self._cell_checkbox(self.quick_table.cellWidget(r, 3))
+            name_item = self.quick_table.item(r, self.QUICK_COL_NAME)
+            cont_item = self.quick_table.item(r, self.QUICK_COL_CONTENT)
+            hex_cb = self._cell_checkbox(self.quick_table.cellWidget(r, self.QUICK_COL_HEX))
+            nl_cb = self._cell_checkbox(self.quick_table.cellWidget(r, self.QUICK_COL_NEWLINE))
+            loop_cb = self._cell_checkbox(self.quick_table.cellWidget(r, self.QUICK_COL_LOOP))
             quicks.append({
                 "name": name_item.text() if name_item else "",
                 "content": cont_item.text() if cont_item else "",
                 "hex": bool(hex_cb and hex_cb.isChecked()),
                 "newline": bool(nl_cb and nl_cb.isChecked()),
+                "loop": bool(loop_cb and loop_cb.isChecked()),
             })
         s.setValue("quick_buttons", json.dumps(quicks, ensure_ascii=False))
 
@@ -2724,6 +2894,7 @@ class DebugTool(QMainWindow):
             self.close()
 
     def closeEvent(self, ev):
+        self._stop_quick_loop()
         # Let the worker release the hardware and deliver its final confirmed
         # sends before Qt exits. Driver calls never run or join on this thread.
         if getattr(self.can_panel.bus, 'async_tx', False):
