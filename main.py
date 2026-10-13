@@ -1208,6 +1208,10 @@ class DebugTool(QMainWindow):
             outline: 0;
         }
         QTableWidget { gridline-color: #3c4045; background: #1e2124; color: #e6e6e6; }
+        QHeaderView { background: #1e2124; }
+        QTableCornerButton::section {
+            background: #2b2f33; border: none; border-right: 1px solid #3c4045;
+        }
         QHeaderView::section {
             background: #2b2f33; padding: 4px; color: #e6e6e6;
             border: none; border-right: 1px solid #3c4045;
