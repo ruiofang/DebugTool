@@ -1,5 +1,7 @@
 """Actionable serial-open diagnostics without changing device permissions."""
 
+from __future__ import annotations
+
 import errno
 import os
 import shlex
