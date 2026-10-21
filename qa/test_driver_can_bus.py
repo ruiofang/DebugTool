@@ -36,6 +36,7 @@ class FakeDriver:
         self.rx = deque()
         self.sent = []
         self.calls = []
+        self.receive_timeouts = []
         self.recv_gate = None
         self.send_gate = None
         self.close_gate = None
@@ -53,6 +54,7 @@ class FakeDriver:
 
     def recv(self, timeout):
         self._record("recv")
+        self.receive_timeouts.append(timeout)
         assert timeout > 0
         if self.recv_gate:
             self.recv_gate.wait(2)
@@ -77,6 +79,24 @@ class FakeDriver:
             self.close_gate.wait(2)
         if self.close_error:
             raise self.close_error
+
+
+class ObservedEvent:
+    """Expose idle waits while retaining real event wakeup behavior."""
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.wait_timeouts = []
+
+    def set(self):
+        self.event.set()
+
+    def clear(self):
+        self.event.clear()
+
+    def wait(self, timeout):
+        self.wait_timeouts.append(timeout)
+        return self.event.wait(timeout)
 
 
 @unittest.skipIf(can is None, "optional python-can dependency is not installed")
@@ -115,6 +135,52 @@ class DriverWorkerTests(unittest.TestCase):
             threads = {ident for _, ident in driver.calls}
             self.assertEqual(len(threads), 1)
             self.assertNotIn(threading.get_ident(), threads)
+
+    def test_receive_poll_uses_one_millisecond_timeout(self):
+        with self.opened() as (_, driver):
+            wait_for(lambda: driver.receive_timeouts)
+            self.assertEqual(transport.DriverCanBus.RECEIVE_TIMEOUT, 0.001)
+            self.assertTrue(all(timeout == 0.001 for timeout in driver.receive_timeouts))
+
+    def test_pending_send_and_close_wake_idle_wait(self):
+        driver = FakeDriver()
+        driver.recv_gate = threading.Event()
+        # Stretch only this test's idle window to make a missing wakeup visible
+        # without asserting sub-millisecond wall-clock scheduling guarantees.
+        with patch.object(transport.DriverCanBus, "RECEIVE_TIMEOUT", 0.5), self.opened(driver) as (bus, _):
+            idle = ObservedEvent()
+            bus._work_ready = idle
+            driver.recv_gate.set()
+            wait_for(lambda: idle.wait_timeouts)
+            self.assertGreater(idle.wait_timeouts[0], 0.4)
+            bus.send(CanFrame(0x123))
+            wait_for(lambda: driver.sent, timeout=0.2)
+            self.assertEqual(driver.sent[0].arbitration_id, 0x123)
+            wait_for(lambda: len(idle.wait_timeouts) >= 2)
+            bus.close()
+            wait_for(lambda: bus.closed, timeout=0.2)
+
+    def test_full_receive_timeout_has_no_extra_fixed_wait(self):
+        driver = FakeDriver()
+        driver.recv_gate = threading.Event()
+
+        def receive(timeout):
+            driver._record("recv")
+            driver.receive_timeouts.append(timeout)
+            driver.recv_gate.wait(2)
+            time.sleep(timeout)
+            return None
+
+        driver.recv = receive
+        with patch.object(transport.DriverCanBus, "RECEIVE_TIMEOUT", 0.02), self.opened(driver) as (bus, _):
+            idle = ObservedEvent()
+            bus._work_ready = idle
+            driver.recv_gate.set()
+            wait_for(lambda: len(driver.receive_timeouts) >= 3)
+            bus.close()
+            wait_for(lambda: bus.closed)
+            self.assertEqual(idle.wait_timeouts, [],
+                             "A receive that consumed its timeout must not add another idle delay")
 
     def test_transmit_confirmation_only_after_driver_accepts(self):
         driver = FakeDriver()

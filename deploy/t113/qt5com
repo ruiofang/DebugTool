@@ -5,5 +5,7 @@ export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-linuxfb:fb=/dev/fb0:mmsize=212x339}"
 export QT_FONT_DPI=96
 export QT5COM_PORTRAIT=1
 export QT5COM_FULLSCREEN=1
+# This board uses the existing FocalTech I2C fallback; set 0 for normal evdev.
+export QT5COM_TOUCH_POLL="${QT5COM_TOUCH_POLL:-1}"
 cd "$QT5COM_HOME/app"
 exec "$QT5COM_HOME/bin/python" "$QT5COM_HOME/app/main.py" "$@"

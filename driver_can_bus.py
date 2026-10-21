@@ -221,7 +221,7 @@ class DriverCanBus:
     async_tx = True
     MAX_RX_FRAMES = 4096
     MAX_PENDING_TX = 256  # queued + in flight + confirmations awaiting the UI
-    RECEIVE_TIMEOUT = 0.01
+    RECEIVE_TIMEOUT = 0.001
     SEND_TIMEOUT = 0.1
 
     def __init__(self, backend, channel, bitrate, fd=False, data_bitrate=2000000,
@@ -265,6 +265,7 @@ class DriverCanBus:
         self._inflight = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._work_ready = threading.Event()
         self._key = (backend, channel)
         with _CHANNEL_LOCK:
             if self._key in _CHANNEL_OWNERS:
@@ -304,6 +305,7 @@ class DriverCanBus:
             if len(self._tx) + len(self._sent) + self._inflight >= self.MAX_PENDING_TX:
                 raise BufferError("CAN 发送队列已满，请降低发送速率")
             self._tx.append(frame)
+            self._work_ready.set()
 
     def drain_sent(self, max_count=256):
         with self._lock:
@@ -321,6 +323,7 @@ class DriverCanBus:
         with self._lock:
             self._stop.set()
             self._tx.clear()
+            self._work_ready.set()
             if not self.closed and self.state != "error":
                 self.state = "closing"
 
@@ -385,11 +388,22 @@ class DriverCanBus:
                     if status & 0x10:  # PCAN_ERROR_BUSOFF, not SocketCAN CAN_ERR_BUSOFF.
                         raise RuntimeError("PCAN 总线 BUS-OFF，请检查比特率、接线和终端电阻后重新打开")
                     next_status = time.monotonic() + 0.25
+                receive_started = time.monotonic()
                 msg = driver.recv(timeout=self.RECEIVE_TIMEOUT)
                 if msg is None:
                     # Some PCAN warning statuses return immediately despite the
-                    # requested timeout; don't turn those into a busy loop.
-                    self._stop.wait(0.001)
+                    # requested timeout. Only wait for its unused portion, and
+                    # let queued TX / close wake the worker immediately. Clear
+                    # under the queue lock so a concurrent send cannot lose its
+                    # wakeup between the empty check and wait.
+                    remaining = self.RECEIVE_TIMEOUT - (time.monotonic() - receive_started)
+                    if remaining > 0:
+                        with self._lock:
+                            pending = bool(self._tx) or self._stop.is_set()
+                            if not pending:
+                                self._work_ready.clear()
+                        if not pending:
+                            self._work_ready.wait(remaining)
                 if msg is not None and self._accept(msg):
                     frame = self._frame(msg)
                     with self._lock:

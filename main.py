@@ -22,6 +22,7 @@ import sys
 import json
 import time
 import datetime
+import codecs
 import struct
 import re
 import threading
@@ -121,9 +122,9 @@ except Exception:
     pass
 
 from PyQt5.QtCore import (Qt, QTimer, QThread, pyqtSignal, QSettings,
-                          QRegExp, QDateTime)
+                          QRegExp, QDateTime, QItemSelectionModel)
 from PyQt5.QtGui import (QTextCursor, QFont, QIcon, QRegExpValidator,
-                         QTextCharFormat, QColor, QPalette)
+                         QTextCharFormat, QTextFormat, QColor, QPalette)
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
     QComboBox, QCheckBox, QTextEdit, QPlainTextEdit, QVBoxLayout, QHBoxLayout,
@@ -142,6 +143,7 @@ from serial_terminal import SerialTerminalPanel
 from serial_access import describe_serial_open_error
 from async_log import AsyncLogWriter
 from can_panel import CanPanel
+from quick_command_table import QuickCommandTable
 
 
 # ------------------------------------------------------------------ #
@@ -628,13 +630,13 @@ class SerialReader(QThread):
                     buf.extend(chunk)
                 # 连续输入也必须交付，不能依赖串口出现空闲间隙。
                 now = time.monotonic()
-                if buf and (len(buf) >= self.MAX_CHUNK_BYTES or
+                if buf and (not n or len(buf) >= self.MAX_CHUNK_BYTES or
                             now - last_flush >= self.FLUSH_INTERVAL):
                     self._publish(bytes(buf))
                     buf.clear()
                     last_flush = now
                 if not n:
-                    self.msleep(5)
+                    self.msleep(1)
             except Exception as e:
                 self.error.emit(str(e))
                 break
@@ -673,6 +675,14 @@ class DebugTool(QMainWindow):
     MAX_DISPLAY_CHARS = 512 * 1024
     MAX_DISPLAY_LINE_CHARS = 1024
     SERIAL_UI_BATCH_BYTES = 32 * 1024
+    LOG_COLOR_PROPERTY = QTextFormat.UserProperty + 1
+    DARK_LOG_COLORS = {
+        "#202020": "#e6e6e6",  # 系统提示
+        "#0d47a1": "#8ab4f8",  # 发送
+        "#1b5e20": "#81c995",  # 接收
+        "#c0392b": "#ff8a80",  # 错误
+        "#6a1b9a": "#ce93d8",  # 自动回复
+    }
 
     def __init__(self):
         super().__init__()
@@ -732,7 +742,9 @@ class DebugTool(QMainWindow):
 
         # 自动发送定时器
         self.auto_send_timer = QTimer(self)
+        self.auto_send_timer.setTimerType(Qt.PreciseTimer)
         self.auto_send_timer.timeout.connect(self.on_send_clicked)
+        self.spn_interval.valueChanged.connect(self.auto_send_timer.setInterval)
         self.transport_mode.setCurrentIndex(max(0, min(self.CAN_MODE, self.settings.value('transport_mode', 0, type=int))))
         self._on_transport_changed(self.transport_mode.currentIndex())
 
@@ -793,6 +805,7 @@ class DebugTool(QMainWindow):
         self.chk_rx_hex = QCheckBox("接收 HEX 显示")
         self.chk_show_time = QCheckBox("显示时间戳 (ms)")
         self.chk_show_time.setChecked(True)
+        self.chk_show_time.setToolTip("同时显示时间和 >> / << 方向前缀；关闭后保留数据和帧信息。")
         self.chk_autoscroll = QCheckBox("自动滚动")
         self.chk_autoscroll.setChecked(True)
         self.chk_log_save = QCheckBox("保存日志到文件")
@@ -850,9 +863,10 @@ class DebugTool(QMainWindow):
 
         self.chk_auto_send = QCheckBox("循环发送")
         self.spn_interval = QSpinBox()
-        self.spn_interval.setRange(10, 600000)
+        self.spn_interval.setRange(1, 600000)
         self.spn_interval.setValue(1000)
         self.spn_interval.setSuffix(" ms")
+        self.spn_interval.setToolTip("循环发送间隔，最小 1 ms；循环运行时也可修改。")
         self.spn_interval.setFixedWidth(130)
         self.chk_auto_send.toggled.connect(self.toggle_auto_send)
 
@@ -1233,10 +1247,45 @@ class DebugTool(QMainWindow):
         self._apply_theme(self.settings.value("theme", "浅色"))
 
     def _apply_theme(self, name: str):
-        if name == "深色":
+        dark = name == "深色"
+        changed = getattr(self, "_dark_theme", None) != dark
+        self._dark_theme = dark
+        if dark:
             self.setStyleSheet(self.DARK_QSS)
         else:
             self.setStyleSheet(self.LIGHT_QSS)
+        if changed:
+            self._recolor_log()
+
+    def _log_color(self, color: str) -> QColor:
+        return QColor(self.DARK_LOG_COLORS.get(color, color) if self._dark_theme else color)
+
+    def _recolor_log(self):
+        # 显式字符颜色会覆盖 QSS；切换主题时也更新已有日志。
+        scrollbars = (self.recv_edit.verticalScrollBar(), self.recv_edit.horizontalScrollBar())
+        positions = [bar.value() for bar in scrollbars]
+        document = self.recv_edit.document()
+        ranges = []
+        block = document.begin()
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                color = fragment.charFormat().property(self.LOG_COLOR_PROPERTY)
+                if fragment.isValid() and color:
+                    ranges.append((fragment.position(), fragment.length(), color))
+                iterator += 1
+            block = block.next()
+        # 先收集范围，再修改格式，避免使文档迭代器失效。
+        cursor = QTextCursor(document)
+        for start, length, color in ranges:
+            cursor.setPosition(start)
+            cursor.setPosition(start + length, QTextCursor.KeepAnchor)
+            fmt = QTextCharFormat()
+            fmt.setForeground(self._log_color(color))
+            cursor.mergeCharFormat(fmt)
+        for bar, position in zip(scrollbars, positions):
+            bar.setValue(position)
 
     def _on_theme_changed(self, name: str):
         self._apply_theme(name)
@@ -1253,7 +1302,7 @@ class DebugTool(QMainWindow):
         self.chk_quick_loop = QCheckBox("定时循环发送")
         self.chk_quick_loop.setToolTip("按表格顺序发送勾选的指令；勾选后立即发送第一条。")
         self.spn_quick_interval = QSpinBox()
-        self.spn_quick_interval.setRange(10, 600000)
+        self.spn_quick_interval.setRange(1, 600000)
         self.spn_quick_interval.setValue(1000)
         self.spn_quick_interval.setSuffix(" ms")
         self.spn_quick_interval.setToolTip("每条指令发送后的等待时间，下一轮也使用此间隔。")
@@ -1278,7 +1327,8 @@ class DebugTool(QMainWindow):
         self.lbl_quick_loop_status.setWordWrap(True)
         v.addWidget(self.lbl_quick_loop_status)
 
-        self.quick_table = QTableWidget(0, 6)
+        self.quick_table = QuickCommandTable(0, 6)
+        self.quick_table.move_rows_requested.connect(self._move_quick_rows)
         self.quick_table.setHorizontalHeaderLabels(
             ["循环", "名称", "内容", "HEX", "附加\\r\\n", "发送"])
         hh = self.quick_table.horizontalHeader()
@@ -1294,6 +1344,7 @@ class DebugTool(QMainWindow):
         self.btn_quick_delete = QPushButton("删除所选")
         self.btn_quick_add.clicked.connect(lambda: self._add_quick_row("新指令", "", False, False))
         self.btn_quick_delete.clicked.connect(self._del_quick_rows)
+        row.addWidget(QLabel("拖动行号调整顺序（可多选）"))
         row.addStretch()
         row.addWidget(self.btn_quick_add)
         row.addWidget(self.btn_quick_delete)
@@ -1432,6 +1483,55 @@ class DebugTool(QMainWindow):
     def _cell_checkbox(self, widget: QWidget) -> QCheckBox | None:
         return getattr(widget, "checkbox", None) if widget else None
 
+    def _quick_entries(self):
+        entries = []
+        for row in range(self.quick_table.rowCount()):
+            name = self.quick_table.item(row, self.QUICK_COL_NAME)
+            content = self.quick_table.item(row, self.QUICK_COL_CONTENT)
+            entry = {"name": name.text() if name else "",
+                     "content": content.text() if content else ""}
+            for key, column in (("hex", self.QUICK_COL_HEX),
+                                ("newline", self.QUICK_COL_NEWLINE),
+                                ("loop", self.QUICK_COL_LOOP)):
+                checkbox = self._cell_checkbox(self.quick_table.cellWidget(row, column))
+                entry[key] = bool(checkbox and checkbox.isChecked())
+            entries.append(entry)
+        return entries
+
+    def _move_quick_rows(self, rows, destination):
+        if self._quick_loop_running or not self.quick_table.isEnabled():
+            return
+        count = self.quick_table.rowCount()
+        rows = sorted(set(rows))
+        if (not rows or any(type(row) is not int or not 0 <= row < count for row in rows)
+                or type(destination) is not int or not 0 <= destination <= count):
+            return
+        remaining = [row for row in range(count) if row not in rows]
+        insert_at = destination - sum(row < destination for row in rows)
+        order = remaining[:insert_at] + rows + remaining[insert_at:]
+        if order == list(range(count)):
+            return
+        # 先提交正在编辑的名称/内容，再快照重建整行。
+        self.quick_table.setFocus(Qt.MouseFocusReason)
+        entries = self._quick_entries()
+        self.quick_table.setUpdatesEnabled(False)
+        try:
+            self.quick_table.setRowCount(0)
+            for row in order:
+                entry = entries[row]
+                self._add_quick_row(entry["name"], entry["content"], entry["hex"],
+                                    entry["newline"], entry["loop"])
+            selection = self.quick_table.selectionModel()
+            for row in range(insert_at, insert_at + len(rows)):
+                selection.select(self.quick_table.model().index(row, self.QUICK_COL_NAME),
+                                 QItemSelectionModel.Select | QItemSelectionModel.Rows)
+            self.quick_table.setCurrentCell(insert_at, self.QUICK_COL_NAME,
+                                            QItemSelectionModel.NoUpdate)
+        finally:
+            self.quick_table.setUpdatesEnabled(True)
+        self.settings.setValue("quick_buttons", json.dumps(self._quick_entries(), ensure_ascii=False))
+        self.settings.sync()
+
     def _add_quick_row(self, name: str, content: str, is_hex: bool, newline: bool,
                        loop_enabled: bool = False):
         r = self.quick_table.rowCount()
@@ -1490,8 +1590,7 @@ class DebugTool(QMainWindow):
             return False
         text, name = command["text"], command["name"]
         shown = bytes_to_hex_str(data) if command["hex"] else text
-        ts = f"[{now_ms()}] " if self.chk_show_time.isChecked() else ""
-        self.append_log(f"{ts}>> [{name}] {shown}", color="#0d47a1")
+        self.append_log(f"{self._display_prefix('TX')}[{name}] {shown}", color="#0d47a1")
         self._write_log_raw(
             f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} "
             f"TX[{name}] -> {shown}\n")
@@ -1943,9 +2042,7 @@ class DebugTool(QMainWindow):
 
     def _network_log(self, direction, peer, text, size):
         label = self.network_panel.mode.currentText()
-        marker = '<<' if direction == 'RX' else '>>'
-        ts = f'[{now_ms()}] ' if self.chk_show_time.isChecked() else ''
-        self.append_log(f'{ts}{marker} [{label} {peer}] ({size} B) {text}',
+        self.append_log(f'{self._display_prefix(direction)}[{label} {peer}] ({size} B) {text}',
                         color='#1b5e20' if direction == 'RX' else '#0d47a1')
         self._write_log_raw(f'{datetime.datetime.now().isoformat(timespec="milliseconds")} {direction} [{label} {peer}] {text}\n')
 
@@ -1987,13 +2084,11 @@ class DebugTool(QMainWindow):
         backend = self.can_panel.backend.currentData()
         if backend != 'socketcan':
             channel = f'{backend}:{channel}'
-        marker = '<<' if direction == 'RX' else '>>'
         for frame in frames:
             timestamp = (datetime.datetime.fromtimestamp(frame.timestamp)
                          if frame.timestamp is not None else datetime.datetime.now())
             details = f'[CAN {channel}] {self._can_frame_text(frame)}'
-            prefix = f'[{timestamp.strftime("%H:%M:%S.%f")[:-3]}] ' if self.chk_show_time.isChecked() else ''
-            shown.append(f'{prefix}{marker} {details}')
+            shown.append(f'{self._display_prefix(direction, timestamp)}{details}')
             records.append(f'{timestamp.isoformat(timespec="milliseconds")} {direction} {details}\n')
         if shown:
             self.append_log('\n'.join(shown), color='#1b5e20' if direction == 'RX' else '#0d47a1')
@@ -2025,9 +2120,16 @@ class DebugTool(QMainWindow):
             received += extra_received
             dropped += extra_dropped
             if remaining:
-                all_data = b"".join(chunks + remaining)
-                dropped += max(0, len(all_data) - self.SERIAL_UI_BATCH_BYTES)
-                chunks = [all_data[-self.SERIAL_UI_BATCH_BYTES:]]
+                chunks = deque(chunks + remaining)
+                excess = max(0, sum(map(len, chunks)) - self.SERIAL_UI_BATCH_BYTES)
+                dropped += excess
+                while excess:
+                    first = chunks.popleft()
+                    removed = min(excess, len(first))
+                    if removed < len(first):
+                        chunks.appendleft(first[removed:])
+                    excess -= removed
+                chunks = list(chunks)
         self.rx_bytes += received
         self._update_counter()
         self._check_log_error()
@@ -2049,21 +2151,26 @@ class DebugTool(QMainWindow):
         self.serial_terminal.feed(data)
 
         if self.chk_rx_hex.isChecked():
-            shown = bytes_to_hex_str(data)
+            shown = [bytes_to_hex_str(chunk) for chunk in chunks]
         else:
             try:
-                shown = data.decode("utf-8")
+                data.decode("utf-8")
             except UnicodeDecodeError:
-                shown = data.decode("latin-1", errors="replace")
+                shown = [chunk.decode("latin-1") for chunk in chunks]
+            else:
+                # 保留读取段边界，同时避免批内 UTF-8 字符跨段时被拆坏。
+                decoder = codecs.getincrementaldecoder("utf-8")()
+                shown = [decoder.decode(chunk) for chunk in chunks]
 
-        ts = f"[{now_ms()}] " if self.chk_show_time.isChecked() else ""
-        self.append_log(f"{ts}<< {shown}", color="#1b5e20")
+        prefix = self._display_prefix('RX')
+        self.append_log("\n".join(prefix + part for part in shown if part), color="#1b5e20")
         if not final:
             for chunk in chunks:
                 if self.pending_modbus_request:
                     self._receive_modbus_data(chunk)
-                if self.chk_auto_reply.isChecked():
-                    self._check_auto_reply(chunk)
+            if self.chk_auto_reply.isChecked():
+                # 展示分段不应把同一刷新批次中的回复触发词拆开。
+                self._check_auto_reply(data)
 
     def _send_terminal_data(self, data: bytes, sensitive: bool = False) -> bool:
         if not (self.ser and self.ser.is_open):
@@ -2080,9 +2187,16 @@ class DebugTool(QMainWindow):
             self.serial_terminal.output.append_notice(f"[发送失败] {exc}")
             return False
         shown = f"[终端输入 {len(data)} 字节，内容未记录]" if sensitive else repr(data.decode('utf-8', errors='replace'))
-        self.append_log(f"[{now_ms()}] >> (终端) {shown}", color="#0d47a1")
+        self.append_log(f"{self._display_prefix('TX')}(终端) {shown}", color="#0d47a1")
         self._write_log_raw(f"{datetime.datetime.now().isoformat(timespec='milliseconds')} TX(terminal) -> {shown}\n")
         return True
+
+    def _display_prefix(self, direction: str, timestamp=None) -> str:
+        if not self.chk_show_time.isChecked():
+            return ""
+        stamp = timestamp.strftime("%H:%M:%S.%f")[:-3] if timestamp is not None else now_ms()
+        marker = '<<' if direction == 'RX' else '>>'
+        return f"[{stamp}] {marker} "
 
     def append_log(self, text: str, color: str = "#202020"):
         # 行数和字符数同时限制，避免无换行的大包使文档无限增长。
@@ -2104,7 +2218,8 @@ class DebugTool(QMainWindow):
             cursor.removeSelectedText()
         cursor.movePosition(QTextCursor.End)
         fmt = QTextCharFormat()
-        fmt.setForeground(QColor(color))
+        fmt.setProperty(self.LOG_COLOR_PROPERTY, color)
+        fmt.setForeground(self._log_color(color))
         cursor.insertText(text, fmt)
         if self.chk_autoscroll.isChecked():
             self.recv_edit.moveCursor(QTextCursor.End)
@@ -2149,8 +2264,7 @@ class DebugTool(QMainWindow):
         self.tx_bytes += len(data)
         self._update_counter()
         shown = bytes_to_hex_str(data) if self.chk_tx_hex.isChecked() else text
-        ts = f"[{now_ms()}] " if self.chk_show_time.isChecked() else ""
-        self.append_log(f"{ts}>> {shown}", color="#0d47a1")
+        self.append_log(f"{self._display_prefix('TX')}{shown}", color="#0d47a1")
         self._write_log_raw(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} TX -> {shown}\n")
 
         self._push_history(text)
@@ -2168,6 +2282,8 @@ class DebugTool(QMainWindow):
     def _push_history(self, text: str):
         text = text.strip()
         if not text:
+            return
+        if self.cmb_history.count() and self.cmb_history.itemText(0) == text:
             return
         items = [self.cmb_history.itemText(i) for i in range(self.cmb_history.count())]
         if text in items:
@@ -2251,8 +2367,7 @@ class DebugTool(QMainWindow):
                     self.tx_bytes += len(out)
                     self._update_counter()
                     shown = bytes_to_hex_str(out) if hex_send else reply
-                    ts = f"[{now_ms()}] " if self.chk_show_time.isChecked() else ""
-                    self.append_log(f"{ts}>> (auto) {shown}", color="#6a1b9a")
+                    self.append_log(f"{self._display_prefix('TX')}(auto) {shown}", color="#6a1b9a")
                     self._write_log_raw(
                         f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} TX(auto) -> {shown}\n")
                 except Exception as e:
@@ -2481,8 +2596,7 @@ class DebugTool(QMainWindow):
         self.modbus_timeout.start(1000)
         self.tx_bytes += len(frame)
         self._update_counter()
-        ts = f"[{now_ms()}] " if self.chk_show_time.isChecked() else ""
-        self.append_log(f"{ts}>> [Modbus] {hex_frame}", color="#0d47a1")
+        self.append_log(f"{self._display_prefix('TX')}[Modbus] {hex_frame}", color="#0d47a1")
         self._write_log_raw(
             f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} TX[Modbus] -> {hex_frame}\n")
         self.modbus_result.setPlainText(f"请求已发送：\n{hex_frame}")
@@ -2871,21 +2985,7 @@ class DebugTool(QMainWindow):
             })
         s.setValue("reply_rules", json.dumps(rules, ensure_ascii=False))
 
-        quicks = []
-        for r in range(self.quick_table.rowCount()):
-            name_item = self.quick_table.item(r, self.QUICK_COL_NAME)
-            cont_item = self.quick_table.item(r, self.QUICK_COL_CONTENT)
-            hex_cb = self._cell_checkbox(self.quick_table.cellWidget(r, self.QUICK_COL_HEX))
-            nl_cb = self._cell_checkbox(self.quick_table.cellWidget(r, self.QUICK_COL_NEWLINE))
-            loop_cb = self._cell_checkbox(self.quick_table.cellWidget(r, self.QUICK_COL_LOOP))
-            quicks.append({
-                "name": name_item.text() if name_item else "",
-                "content": cont_item.text() if cont_item else "",
-                "hex": bool(hex_cb and hex_cb.isChecked()),
-                "newline": bool(nl_cb and nl_cb.isChecked()),
-                "loop": bool(loop_cb and loop_cb.isChecked()),
-            })
-        s.setValue("quick_buttons", json.dumps(quicks, ensure_ascii=False))
+        s.setValue("quick_buttons", json.dumps(self._quick_entries(), ensure_ascii=False))
 
         s.setValue("last_send", self.send_edit.toPlainText())
         s.setValue("geometry", self.saveGeometry())

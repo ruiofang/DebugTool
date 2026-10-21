@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 4, 0),
-    prodvers=(1, 0, 4, 0),
+    filevers=(1, 0, 5, 0),
+    prodvers=(1, 0, 5, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -18,12 +18,12 @@ VSVersionInfo(
           [
             StringStruct(u'CompanyName',      u'RUIO'),
             StringStruct(u'FileDescription',  u'DebugTool'),
-            StringStruct(u'FileVersion',      u'V1.0.4'),
+            StringStruct(u'FileVersion',      u'V1.0.5'),
             StringStruct(u'InternalName',     u'DebugTool'),
             StringStruct(u'LegalCopyright',   u'Copyright (c) RUIO'),
-            StringStruct(u'OriginalFilename', u'DebugTool-V1.0.4.exe'),
+            StringStruct(u'OriginalFilename', u'DebugTool-V1.0.5.exe'),
             StringStruct(u'ProductName',      u'DebugTool'),
-            StringStruct(u'ProductVersion',   u'V1.0.4')
+            StringStruct(u'ProductVersion',   u'V1.0.5')
           ])
       ]),
     VarFileInfo([VarStruct(u'Translation', [1033, 1200])])

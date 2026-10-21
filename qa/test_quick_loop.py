@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QSettings
+from PyQt5.QtCore import QSettings, Qt
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication
 
@@ -120,7 +120,7 @@ class QuickLoopTests(unittest.TestCase):
 
     def test_selected_rows_send_in_order_for_exact_rounds_with_real_intervals(self):
         window, serial = self.serial_window()
-        self.assertGreaterEqual(window.spn_quick_interval.minimum(), 10)
+        self.assertEqual(window.spn_quick_interval.minimum(), 1)
         self.assertEqual(window.spn_quick_rounds.value(), 1)
         self.assertTrue(window.quick_loop_timer.isSingleShot())
         self.add_row(window, "first", "A")
@@ -140,6 +140,55 @@ class QuickLoopTests(unittest.TestCase):
             self.assertGreaterEqual(later - earlier, 0.038)
         self.assert_stopped(window)
         self.assert_no_more(serial.writes)
+
+    def test_one_millisecond_main_loop_sends_stops_and_restores_interval(self):
+        window, serial = self.serial_window()
+        window.send_edit.setPlainText("A")
+        window.chk_tx_hex.setChecked(False)
+        window.chk_tx_newline.setChecked(False)
+        self.assertEqual(window.spn_interval.minimum(), 1)
+        self.assertEqual(window.auto_send_timer.timerType(), Qt.PreciseTimer)
+        window.spn_interval.setValue(1)
+        window.chk_auto_send.setChecked(True)
+        self.assertEqual(window.auto_send_timer.interval(), 1)
+        self.wait_until(lambda: len(serial.writes) >= 3)
+        self.assertTrue(all(payload == b"A" for payload in serial.writes))
+        window.spn_interval.setValue(2)
+        self.assertEqual(window.auto_send_timer.interval(), 2)
+        self.assertTrue(window.auto_send_timer.isActive())
+        window.spn_interval.setValue(1)
+        window.chk_auto_send.setChecked(False)
+        self.assertFalse(window.auto_send_timer.isActive())
+        self.assert_no_more(serial.writes, 35)
+        window._save_settings()
+        window.settings.sync()
+        self.close_window(window)
+        restarted = self.open_window()
+        self.assertEqual(restarted.spn_interval.value(), 1)
+        self.assertFalse(restarted.chk_auto_send.isChecked())
+        self.assertFalse(restarted.auto_send_timer.isActive())
+
+    def test_one_millisecond_quick_loop_sends_stops_and_restores_interval(self):
+        window, serial = self.serial_window()
+        self.add_row(window, "first", "A")
+        self.add_row(window, "last", "C")
+        self.assertEqual(window.spn_quick_interval.minimum(), 1)
+        self.assertEqual(window.quick_loop_timer.timerType(), Qt.PreciseTimer)
+        self.start(window, interval=1, rounds=0)
+        self.assertEqual(window.quick_loop_timer.interval(), 1)
+        self.wait_until(lambda: len(serial.writes) >= 4)
+        self.assertEqual(serial.writes, [b"A" if index % 2 == 0 else b"C"
+                                         for index in range(len(serial.writes))])
+        window.btn_quick_stop.click()
+        self.assert_stopped(window)
+        self.assert_no_more(serial.writes, 35)
+        window._save_settings()
+        window.settings.sync()
+        self.close_window(window)
+        restarted = self.open_window()
+        self.assertEqual(restarted.spn_quick_interval.value(), 1)
+        self.assertEqual(restarted.spn_quick_rounds.value(), 0)
+        self.assert_stopped(restarted)
 
     @unittest.skipUnless(os.name == "posix" and hasattr(os, "openpty"),
                          "POSIX pseudo-terminals are required")
