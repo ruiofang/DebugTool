@@ -388,6 +388,7 @@ class CanPanelTests(unittest.TestCase):
 
     def test_classic_extended_and_empty_frames_count_payload_bytes(self):
         bus = self.open_panel()
+        self.panel.pad_classic_tx.setChecked(False)
         self.assertTrue(self.panel.send_text('01 02 ff'))
         self.assertEqual(bus.sent[-1], CanFrame(0x123, b'\x01\x02\xff'))
         self.panel.tx_extended.setChecked(True)
@@ -398,6 +399,22 @@ class CanPanelTests(unittest.TestCase):
         self.assertEqual(self.sent, bus.sent)
         self.assertEqual((self.panel.tx_frames, self.panel.tx_bytes), (2, 3))
         self.assertIn('2 帧 / 3 B', self.panel.counts.text())
+
+    def test_classic_padding_sets_eight_byte_dlc_for_standard_and_extended_frames(self):
+        bus = self.open_panel()
+        self.assertTrue(self.panel.pad_classic_tx.isChecked())
+        for extended in (False, True):
+            self.panel.tx_extended.setChecked(extended)
+            self.assertTrue(self.panel.send_text('AA BB'))
+            frame = bus.sent[-1]
+            self.assertEqual(frame.extended, extended)
+            self.assertEqual(frame.data, b'\xAA\xBB' + bytes(6))
+            self.assertEqual(encode_frame(frame)[4], 8)
+        self.assertTrue(self.panel.send_text('00 01 02 03 04 05 06 07'))
+        self.assertEqual(bus.sent[-1].data, bytes(range(8)))
+        self.assertTrue(self.panel.send_text(''))
+        self.assertEqual(bus.sent[-1].data, bytes(8))
+        self.assertEqual((self.panel.tx_frames, self.panel.tx_bytes), (4, 32))
 
     def test_invalid_payload_and_id_stop_cycle_without_closing_or_sending(self):
         bus = self.open_panel()
@@ -432,6 +449,9 @@ class CanPanelTests(unittest.TestCase):
         self.assertTrue(self.panel.send_text('AA ' * 12))
         self.assertEqual(bus.sent[-1], CanFrame(0x123, b'\xaa' * 12, fd=True, bitrate_switch=True))
         self.assertEqual(self.panel.tx_bytes, 12)
+        self.assertTrue(self.panel.send_text('AA BB'))
+        self.assertEqual(bus.sent[-1], CanFrame(0x123, b'\xaa\xbb', fd=True, bitrate_switch=True))
+        self.assertEqual(self.panel.tx_bytes, 14)
 
     def test_send_socket_error_stops_cycle_before_closing(self):
         bus = self.open_panel()
@@ -522,6 +542,7 @@ class CanPanelTests(unittest.TestCase):
         self.panel.tx_id.setText('ABCDE')
         self.panel.tx_extended.setChecked(True)
         self.panel.brs.setChecked(True)
+        self.panel.pad_classic_tx.setChecked(False)
         self.panel.bitrate.setCurrentText('83333')
         self.panel.save_settings()
         restored = can_panel.CanPanel(self.settings)
@@ -532,6 +553,7 @@ class CanPanelTests(unittest.TestCase):
             self.assertEqual(restored.tx_id.text(), 'ABCDE')
             self.assertTrue(restored.tx_extended.isChecked())
             self.assertTrue(restored.brs.isChecked())
+            self.assertFalse(restored.pad_classic_tx.isChecked())
             self.assertEqual(restored.bitrate.currentText(), '83333')
             self.assertFalse(restored.active)
             self.factory.assert_not_called()

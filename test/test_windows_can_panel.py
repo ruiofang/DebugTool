@@ -15,7 +15,7 @@ from PyQt5.QtCore import QSettings
 from PyQt5.QtWidgets import QApplication
 
 import can_panel
-from qa.test_can_panel import FakeBus
+from test_can_panel import FakeBus
 from socketcan_bus import CanFrame
 
 
@@ -139,7 +139,7 @@ class DriverPanelTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         bus.confirmed.append(bus.sent[0])
         self.panel.drain()
-        self.assertEqual((self.panel.tx_frames, self.panel.tx_bytes), (1, 2))
+        self.assertEqual((self.panel.tx_frames, self.panel.tx_bytes), (1, 8))
         self.assertEqual(self.sent, bus.sent)
         self.panel.drain()
         self.assertEqual(len(self.sent), 1)
@@ -165,7 +165,7 @@ class DriverPanelTests(unittest.TestCase):
         bus.confirmed.append(bus.sent[0])
         bus.closed = True
         self.panel.drain()
-        self.assertEqual((self.panel.tx_frames, self.panel.tx_bytes), (1, 1))
+        self.assertEqual((self.panel.tx_frames, self.panel.tx_bytes), (1, 8))
         self.assertIsNone(self.panel.bus)
         self.assertFalse(self.panel.closing)
         self.assertIn('驱动通道已关闭', self.panel.status.text())

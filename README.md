@@ -123,6 +123,21 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s qa -v
 
 点击 CAN 的 **关闭** 会先停止收发、释放 socket，再自动将对应接口设为 **DOWN**，需要权限时弹出系统认证窗口。只有检查到接口确实 DOWN 后才显示停用成功；取消认证或停用失败会显示原因，并可点击“重试停用”再次执行。再次点击“打开”会按所选参数重新启用接口。停用接口或修改比特率会影响同一接口上的其他程序。切换通信模式、退出程序或遇到收发错误时，仅释放本程序的连接，不主动停用系统接口。
 
+#### Linux 创芯科技 CANFD
+
+`DOC/Linux资料包V1.03` 中的创芯 USBCANFD-200U 使用专用 `libcontrolcanfd.so` 和 `ZCAN_*` 接口（设备类型 `41`）。在“连接配置”选择 **CAN → 创芯科技 CANFD（Linux）**。第一台设备的 `0:0`、`0:1` 分别打开 CAN0、CAN1，`0:0+1` 在一次连接中同时打开两路。此后端直接访问 USB。
+
+1. 插入设备并关闭占用它的厂商软件。安装脚本会为本机当前活动桌面用户配置 `04d8:0053` 设备的 USB 访问权限。便携版可在项目目录执行 `sudo ./install.sh --canfd-permissions` 单独安装这条规则，再以普通用户打开设备。
+2. 点击 **刷新** 会只读扫描 Linux sysfs 中 `VID=04d8 / PID=0053` 的 USB 设备，按数量提供索引候选。设备索引支持 `0–7`，每台提供 CAN0、CAN1 和双通道选项。多设备时请确认 SDK 索引，重新插拔后再次核对。
+3. 设置总线使用的仲裁比特率。需要 FD 时勾选 **启用 CAN FD**，并选择 FD 数据比特率。双通道时左侧参数用于 CAN0，CAN1 默认沿用。两路参数不同时，可打开 **高级…** 并勾选 **CAN1 使用独立设置**。仲裁支持 `50k、100k、125k、250k、500k、800k、1M`。数据支持 `100k、125k、250k、500k、800k、1M、2M、4M、5M`，且须不低于仲裁比特率。此适配器使用 ISO CAN FD。
+4. 点击一次 **打开**，程序使用同一个设备句柄启动所选通道。双通道同时接收，发送区可选择 CAN0 或 CAN1，切换发送目标会停止循环发送。收发日志显示实际通道，比如 `[CAN controlcanfd:0:1]`。点击 **关闭** 会复位所选通道，再关闭 USB 设备。任一通道启动失败时会释放已取得的句柄。
+
+“接收自身发送帧”在此后端提供驱动接受发送后的软件回显，不启用硬件自测模式；TX 计数及回显不代表总线上其他节点已 ACK。ID/格式过滤由后台收发线程执行。源码启动和程序重启均不会自动打开设备或发送数据。
+
+运行库按 `x86_64、x86_32、aarch64、aarch32、riscv64` 存放在 `lib/controlcanfd/`。源码运行时，程序按 Python 进程架构选择对应的 `libcontrolcanfd.so`，通过标准库 `ctypes` 加载。Linux 的 `build.py` 将匹配的 `.so` 内置到单文件可执行程序，分发时只需复制可执行文件。若支持的架构缺少运行库，打包会报错退出，可从 `DOC/Linux资料包V1.03` 恢复对应 `.so` 后重试。SDK 未提供运行库的架构会显示警告。[运行库目录说明](lib/controlcanfd/README.md)
+
+软件回归使用编译的模拟 SDK 验证指针句柄、结构体布局、打开顺序、失败清理及收发队列，并用临时 sysfs 目录验证刷新操作；实际 USB 设备打开、总线时序、收发和拔插仍需用目标适配器验收。
+
 #### Windows PCAN / candleLight
 
 在“连接配置”选择 **CAN**，再选择对应的 **CAN 驱动**。Windows 默认 PCAN；SocketCAN 选项不可用。设备枚举、打开、收发、关闭都在后台执行，点击“打开”后可取消等待；每种驱动分别记忆通道。
@@ -138,7 +153,7 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s qa -v
 
 已有正确驱动可直接使用。PCAN 如果报告找不到 `PCANBasic.dll`，请检查 PEAK PCAN-Basic 运行库及 32/64 位是否与打包所用 Python 一致；程序不分发 PEAK 厂商 DLL。candleLight 即使安装了厂商驱动，也须确认它提供 gs_usb 协议且 USB 驱动允许 libusb 访问；仅显示为串口的固件或其他厂商专有协议不适用。程序不会替换设备驱动。参考 [PEAK PCAN-Basic](https://www.peak-system.com/products/software/development-packages/pcan-basic/?L=1)、[python-can PCAN](https://python-can.readthedocs.io/en/stable/interfaces/pcan.html) 和 [gs_usb 接口说明](https://python-can.readthedocs.io/en/stable/interfaces/gs_usb.html)。
 
-Windows 源码运行和自行打包时，先在同一 Python 环境运行 `python -m pip install -r requirements.txt`。依赖固定为已适配的 python-can / gs-usb / PyUSB 版本；`build.py` 检查 Windows CAN 依赖，并收集动态驱动模块和 libusb DLL。Linux 如需使用可选 PCAN/gs_usb 后端，可另外安装 `python-can==4.6.1 gs-usb==0.3.1 pyusb==1.3.1 libusb-package==1.0.30.0 uptime==3.0.1`；常规 Linux USB-CAN 优先选择系统 SocketCAN 接口。
+Windows 源码运行和自行打包时，先在同一 Python 环境运行 `python -m pip install -r requirements.txt`。依赖固定为已适配的 python-can / gs-usb / PyUSB 版本；`build.py` 检查 Windows CAN 依赖，并收集动态驱动模块和 libusb DLL。Linux 如需使用可选 PCAN/gs_usb 后端，可另外安装 `python-can==4.6.1 gs-usb==0.3.1 pyusb==1.3.1 libusb-package==1.0.30.0 uptime==3.0.1`；由内核驱动提供 `can0` 等接口的适配器使用 SocketCAN，资料包中的创芯设备使用上方专用后端。
 
 驱动接收队列有容量限制，溢出会显示丢帧数。发送先进入有界队列，只有驱动返回发送成功后才增加 TX 计数及写入 TX 日志；关闭时丢弃尚未交给驱动的待发帧，并等待正在进行的调用返回。拔出设备或驱动报错会停止循环发送并报告原因。退出程序会异步等待驱动释放通道和最后的 TX 确认；如果厂商驱动调用未返回，界面显示等待状态。candleLight 时间戳由首帧接收时的本机时间与设备相对时间换算。
 
@@ -146,10 +161,10 @@ Windows 回归使用模拟驱动验证界面、后台队列和打包参数；实
 
 #### 收发与日志
 
-- **帧格式**：标准 ID 为 `000–7FF`，扩展 ID 为 `00000000–1FFFFFFF`，ID 默认按十六进制解释。经典数据帧为 0–8 字节；RTR 的发送框必须为空，用“请求长度”设置 DLC 0–8。CAN FD 不支持 RTR，允许 0–8、12、16、20、24、32、48、64 字节。非法 ID、奇数位/无效 HEX、超长数据会拒绝发送，不会自动截断、分帧或补零。
+- **帧格式**　标准 ID 为 `000–7FF`，扩展 ID 为 `00000000–1FFFFFFF`，ID 默认按十六进制解释。经典 CAN 数据帧默认勾选 **补齐 8 字节**，发送时在数据末尾补 `00`，实际 DLC 为 8。取消勾选后按输入的 0–8 字节发送。RTR 的发送框必须为空，用“请求长度”设置 DLC 0–8。CAN FD 按输入长度发送，允许 0–8、12、16、20、24、32、48、64 字节。非法 ID、奇数位或无效的 HEX、超长数据会拒绝发送。
 - **发送选项**：CAN 使用专用帧设置，数据固定为 HEX；普通串口的附加换行和校验和不会进入 CAN 帧。自动回复、Modbus、串口终端和普通快捷按钮在 CAN 模式下禁用，避免误用字节流协议；SSH/本地终端仍可单独使用。
 - **过滤**：连接前设置 RX ID、掩码和格式。掩码 `0` 接收全部 ID；精确接收标准 `123` 可设 ID=`123`、掩码=`7FF`、格式=标准帧；扩展精确过滤用掩码=`1FFFFFFF`。默认关闭本程序的自身发送回环；“接收总线错误帧”独立控制错误通知，不受普通 ID 过滤影响。
-- **计数和错误**：CAN 模式同时显示帧数和载荷字节数，RTR 字节数为 0。TX 表示内核或驱动已接受该帧，不代表其他节点已 ACK。检测到 BUS-OFF 会停止循环发送；SocketCAN 保留错误诊断连接，驱动异常会关闭 PCAN/gs_usb 通道。接收队列溢出会显示丢帧数，出现该提示时显示和日志均可能缺帧。
+- **计数和错误**：CAN 模式同时显示帧数和载荷字节数，RTR 字节数为 0。TX 表示内核或驱动已接受该帧，不代表其他节点已 ACK。检测到 BUS-OFF 会停止循环发送；SocketCAN 保留错误诊断连接，驱动异常会关闭 PCAN/gs_usb/创芯通道。接收队列溢出会显示丢帧数，出现该提示时显示和日志均可能缺帧。
 - **大流量和退出**：每 20 ms 最多读取 256 帧或处理 6 ms，再批量更新现有有界接收区；日志使用后台写入。切换模式、关闭接口或退出时停止循环发送并释放连接。保存上次参数，重新启动不会自动打开接口或发帧。
 
 软件回归：`QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s qa -v`。另可运行 `bash qa/run_socketcan_vcan_tests.sh`，在独立用户/网络/挂载命名空间创建临时 `vcan_test`，通过实际 Linux CAN socket 验证标准/扩展/RTR/FD、内核过滤、回环、从 DOWN 状态一键打开、点击关闭后 DOWN 并重新打开，以及主窗口收发、循环发送和日志。需要内核支持 vcan 和非特权用户命名空间；测试不会使用真实 `can0`。
@@ -358,6 +373,12 @@ python3 gen_icon.py           # 重新生成 app.png / app.ico
 ---
 
 ## 更新记录
+
+### 未发布（2026-11-18）
+
+- 对照 `DOC/Linux资料包V1.03` 新增创芯科技 CANFD Linux 专用驱动，修复该设备无法通过现有 CAN 后端正常打开的问题。
+- 使用匹配进程架构的厂商运行库、指针宽度正确的句柄和打包 C 结构；打开失败释放资源，经典 CAN 与 FD 分别收发。
+- 新增只读 USB 通道候选刷新、5M 数据比特率限制及 Linux SDK 打包收集；模拟 SDK 回归与实机验收范围分别说明。
 
 ### V1.0.5（2026-10-21）
 

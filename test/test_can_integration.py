@@ -198,18 +198,33 @@ class CanWindowTests(unittest.TestCase):
                 patch.object(window, "_maybe_append_checksum") as checksum:
             window.send_edit.setPlainText("01 02 AA FF")
             window.btn_send.click()
-        self.assertEqual(bus.sent, [CanFrame(0x123, b"\x01\x02\xaa\xff")])
+        self.assertEqual(bus.sent, [CanFrame(0x123, b"\x01\x02\xaa\xff" + bytes(4))])
         network_send.assert_not_called()
         checksum.assert_not_called()
         self.assertIsNone(window.ser)
         self.assertEqual(window.can_panel.tx_frames, 1)
-        self.assertEqual(window.can_panel.tx_bytes, 4)
-        self.assertEqual(window.tx_bytes, 4)
+        self.assertEqual(window.can_panel.tx_bytes, 8)
+        self.assertEqual(window.tx_bytes, 8)
         self.assertEqual(window.cmb_history.itemText(0), "01 02 AA FF")
+        self.assertIn('LEN=8 DATA=01 02 AA FF 00 00 00 00', window.recv_edit.toPlainText())
+
+    def test_classic_cyclic_send_uses_padding_and_stops_when_setting_changes(self):
+        bus = self.open_can()
+        window = self.window
+        window.send_edit.setPlainText('AA BB')
+        window.spn_interval.setValue(20)
+        window.chk_auto_send.setChecked(True)
+        self.pump_until(lambda: len(bus.sent) >= 2)
+        self.assertTrue(all(frame.data == b'\xAA\xBB' + bytes(6) for frame in bus.sent))
+        window.can_panel.pad_classic_tx.setChecked(False)
+        self.assertFalse(window.auto_send_timer.isActive())
+        window.btn_send.click()
+        self.assertEqual(bus.sent[-1].data, b'\xAA\xBB')
 
     def test_empty_data_and_rtr_frames_can_be_sent_from_shared_editor(self):
         bus = self.open_can()
         window = self.window
+        window.can_panel.pad_classic_tx.setChecked(False)
         window.send_edit.clear()
         window.btn_send.click()
         window.can_panel.frame_type.setCurrentIndex(1)
@@ -301,7 +316,7 @@ class CanWindowTests(unittest.TestCase):
         self.assertIsNone(window.log_file)
         self.assertTrue(writer.closed)
         self.assertIsNone(writer.error)
-        self.assertIn(" TX [CAN vcan-test] ID=0x123 STD DATA LEN=1 DATA=AA", self.read_log())
+        self.assertIn(" TX [CAN vcan-test] ID=0x123 STD DATA LEN=8 DATA=AA 00 00 00 00 00 00 00", self.read_log())
 
     def test_mode_switch_cancels_pending_configuration_without_late_connection(self):
         FakeConfigurator.defer = True

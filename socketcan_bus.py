@@ -57,6 +57,7 @@ class CanFrame:
     dlc: int | None = None
     error: bool = False
     timestamp: float | None = None
+    channel: str | None = None  # Physical port on multi-channel driver connections.
 
     def __post_init__(self):
         _validate_frame(self)

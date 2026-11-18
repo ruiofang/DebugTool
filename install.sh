@@ -10,6 +10,7 @@
 #   sudo ./install.sh             # 安装，为 sudo 调用者配置文件及串口权限
 #   sudo ./install.sh --user ruio # 为指定普通用户安装
 #   sudo ./install.sh --permissions-only # 仅修复现有安装的配置及串口权限
+#   sudo ./install.sh --canfd-permissions # 仅配置创芯 CANFD USB 权限
 #   sudo ./install.sh --uninstall # 卸载主程序，保留 CAN 助手和授权策略
 #
 set -e
@@ -38,6 +39,7 @@ INSTALL_HOME=""
 SERIAL_GROUP=""
 SERIAL_RULES_DIR="/etc/udev/rules.d"
 SERIAL_RULES="$SERIAL_RULES_DIR/70-debugtool-serial.rules"
+CANFD_RULES="$SERIAL_RULES_DIR/70-debugtool-canfd.rules"
 SERIAL_DEVICE_DIR="/dev"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -223,6 +225,31 @@ install_serial_permissions() (
         echo "   当前会话权限若未生效，请注销并重新登录，再重新插拔串口设备。"
     fi
     echo "   其他程序独占串口产生的 Errno 11 需要先关闭占用程序；权限修复不会抢占设备。"
+)
+
+check_canfd_dependencies() {
+    command -v udevadm >/dev/null 2>&1 || {
+        echo "✘ 配置创芯 CANFD 权限需要 udevadm。" >&2
+        return 1
+    }
+    check_secure_file_target "$CANFD_RULES"
+}
+
+install_canfd_permissions() (
+    set -e
+    local staged_dir
+    ensure_secure_directory "$SERIAL_RULES_DIR"
+    staged_dir=$(mktemp -d "$SERIAL_RULES_DIR/.debugtool-canfd.XXXXXX") || exit 1
+    trap 'rm -rf -- "$staged_dir"' EXIT
+    cat > "$staged_dir/rule" <<'EOF'
+# DebugTool: allow the active local desktop session to access Chuang Xin CANFD.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="04d8", ATTR{idProduct}=="0053", TAG+="uaccess"
+EOF
+    install_can_file "$staged_dir/rule" "$CANFD_RULES" 0644
+    udevadm control --reload-rules
+    udevadm trigger --action=change --subsystem-match=usb --attr-match=idVendor=04d8 --attr-match=idProduct=0053
+    udevadm settle --timeout=5
+    echo "✔ 已配置创芯 CANFD USB 权限（本机当前活动桌面用户）。"
 )
 
 repair_permissions() {
@@ -473,6 +500,7 @@ install_app() {
     resolve_install_user || exit 1
     check_app_directory || exit 1
     check_serial_dependencies || exit 1
+    check_canfd_dependencies || exit 1
 
     # 2. 图标
     ICON_SRC=""
@@ -522,6 +550,7 @@ EOF
 
     # 7. Dedicated CAN-only authorization, independent of the GUI installation.
     install_can_permissions
+    install_canfd_permissions
 
     # 8. 安装时配置串口组、设备热插拔权限和当前设备 ACL。
     install_serial_permissions
@@ -541,6 +570,7 @@ main() {
             -h|--help)
                 echo "用法: sudo $0 [--user 用户名] [可执行文件]"
                 echo "      sudo $0 [--user 用户名] --permissions-only"
+                echo "      sudo $0 --canfd-permissions"
                 echo "      sudo $0 --uninstall"
                 echo "默认用户为 SUDO_USER；root 直接运行时须指定 --user。"
                 return 0 ;;
@@ -554,6 +584,10 @@ main() {
             --permissions-only)
                 [[ "$mode" == install ]] || { echo "✘ 操作参数冲突。" >&2; return 1; }
                 mode=permissions
+                shift ;;
+            --canfd-permissions)
+                [[ "$mode" == install ]] || { echo "✘ 操作参数冲突。" >&2; return 1; }
+                mode=canfd_permissions
                 shift ;;
             --uninstall|-u)
                 [[ "$mode" == install ]] || { echo "✘ 操作参数冲突。" >&2; return 1; }
@@ -573,6 +607,7 @@ main() {
     case "$mode" in
         install) install_app "$executable" ;;
         permissions) repair_permissions ;;
+        canfd_permissions) need_root; check_canfd_dependencies && install_canfd_permissions ;;
         uninstall) uninstall ;;
     esac
 }

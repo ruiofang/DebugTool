@@ -42,6 +42,7 @@ THEME_ICON_DEST="$TEST_ROOT/usr/share/icons/hicolor/256x256/apps/qt5com.png"
 ICON_THEME_DIR="$TEST_ROOT/usr/share/icons/hicolor"
 SERIAL_RULES_DIR="$TEST_ROOT/etc/udev/rules.d"
 SERIAL_RULES="$SERIAL_RULES_DIR/70-debugtool-serial.rules"
+CANFD_RULES="$SERIAL_RULES_DIR/70-debugtool-canfd.rules"
 SERIAL_DEVICE_DIR="$TEST_ROOT/dev"
 SUDO_USER='testuser'
 
@@ -177,6 +178,22 @@ class InstallCanPermissionsTests(unittest.TestCase):
 
     def install_permissions(self):
         return self.shell("install_can_permissions", check=True)
+
+    def test_canfd_permissions_only_refreshes_the_matching_usb_device(self):
+        self.shell('SUDO_USER=; main --canfd-permissions', check=True)
+        rules = self.root / 'etc/udev/rules.d/70-debugtool-canfd.rules'
+        lines = [line for line in rules.read_text().splitlines() if not line.startswith('#')]
+        self.assertEqual(lines, ['SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", '
+                                 'ATTR{idVendor}=="04d8", ATTR{idProduct}=="0053", TAG+="uaccess"'])
+        self.assertEqual(stat.S_IMODE(rules.stat().st_mode), 0o644)
+        calls = (self.root / 'mutations.log').read_text().splitlines()
+        self.assertEqual([line for line in calls if line.startswith('udevadm ')], [
+            'udevadm control --reload-rules',
+            'udevadm trigger --action=change --subsystem-match=usb --attr-match=idVendor=04d8 --attr-match=idProduct=0053',
+            'udevadm settle --timeout=5',
+        ])
+        self.assertFalse(self.policy.exists())
+        self.assertFalse((self.root / 'opt/qt5com').exists())
 
     def test_policy_authorizes_only_dedicated_launcher_for_active_local_users(self):
         self.install_permissions()

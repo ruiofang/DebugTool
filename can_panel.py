@@ -9,13 +9,14 @@ from pathlib import Path
 
 from PyQt5.QtCore import QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QFormLayout, QGridLayout, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from socketcan_bus import (CanFrame, SocketCanBus, interface_details, list_can_interfaces,
                            parse_can_id, parse_hex_payload)
 from can_configurator import CanConfigurator
+from controlcanfd_bus import ARBITRATION_BITRATES, DATA_BITRATES
 from driver_can_bus import DriverCanBus, discover_channels
 
 
@@ -60,8 +61,10 @@ class CanPanel(QWidget):
         self.backend.addItem('SocketCAN（Linux）', 'socketcan')
         self.backend.addItem('PCAN（PEAK）', 'pcan')
         self.backend.addItem('candleLight（gs_usb）', 'gs_usb')
+        self.backend.addItem('创芯科技 CANFD（Linux）', 'controlcanfd')
         if sys.platform != 'linux':
             self.backend.model().item(0).setEnabled(False)
+            self.backend.model().item(self.backend.findData('controlcanfd')).setEnabled(False)
         self.backend.setToolTip('选择适配器驱动；Windows 使用 PCAN 或 candleLight。')
         grid.addWidget(QLabel('CAN 驱动'), 0, 0)
         grid.addWidget(self.backend, 0, 1)
@@ -160,6 +163,9 @@ class CanPanel(QWidget):
         self.rtr_dlc_label = QLabel('请求长度')
         self.brs = QCheckBox('BRS 加速')
         self.brs.setToolTip('CAN FD 数据阶段切换到系统配置的 dbitrate。')
+        self.pad_classic_tx = QCheckBox('补齐 8 字节')
+        self.pad_classic_tx.setChecked(True)
+        self.pad_classic_tx.setToolTip('经典 CAN 数据帧在末尾补 00，实际发送长度为 8 字节。')
         send_layout.addWidget(QLabel('CAN ID (HEX)'), 0, 0)
         send_layout.addWidget(self.tx_id, 0, 1)
         send_layout.addWidget(self.tx_extended, 0, 2)
@@ -167,10 +173,16 @@ class CanPanel(QWidget):
         send_layout.addWidget(self.rtr_dlc_label, 0, 4)
         send_layout.addWidget(self.rtr_dlc, 0, 5)
         send_layout.addWidget(self.brs, 0, 6)
-        send_layout.setColumnStretch(7, 1)
-        self.payload_hint = QLabel('发送框填写 HEX 数据；经典 CAN 最多 8 字节，可发送空数据帧。')
+        send_layout.addWidget(self.pad_classic_tx, 0, 4, 1, 3)
+        self.tx_channel = QComboBox()
+        self.tx_channel.addItems(['发送到 CAN0', '发送到 CAN1'])
+        self.tx_channel.setToolTip('选择发送目标。切换通道会停止循环发送。')
+        self.tx_channel.currentIndexChanged.connect(self._tx_channel_changed)
+        send_layout.addWidget(self.tx_channel, 0, 7)
+        send_layout.setColumnStretch(8, 1)
+        self.payload_hint = QLabel()
         self.payload_hint.setWordWrap(True)
-        send_layout.addWidget(self.payload_hint, 1, 0, 1, 8)
+        send_layout.addWidget(self.payload_hint, 1, 0, 1, 9)
 
         self.config_dialog = QDialog(self)
         self.config_dialog.setWindowTitle('SocketCAN 高级信息')
@@ -185,6 +197,24 @@ class CanPanel(QWidget):
         self.config_commands = QPlainTextEdit()
         self.config_commands.setReadOnly(True)
         config_layout.addWidget(self.config_commands)
+        self.can1_settings = QGroupBox('CAN1 使用独立设置')
+        self.can1_settings.setCheckable(True)
+        self.can1_settings.setChecked(False)
+        self.can1_settings.setToolTip('默认使用与 CAN0 相同的连接参数。')
+        can1_layout = QFormLayout(self.can1_settings)
+        self.can1_bitrate = QComboBox()
+        self.can1_bitrate.addItems([str(rate) for rate in ARBITRATION_BITRATES])
+        self.can1_bitrate.setCurrentText('500000')
+        self.can1_data_bitrate = QComboBox()
+        self.can1_data_bitrate.addItems([str(rate) for rate in DATA_BITRATES])
+        self.can1_data_bitrate.setCurrentText('2000000')
+        self.can1_fd = QCheckBox('启用 CAN FD')
+        self.can1_fd.setChecked(True)
+        self.can1_fd.toggled.connect(self.can1_data_bitrate.setEnabled)
+        can1_layout.addRow('仲裁比特率 (bit/s)', self.can1_bitrate)
+        can1_layout.addRow('FD 数据比特率 (bit/s)', self.can1_data_bitrate)
+        can1_layout.addRow(self.can1_fd)
+        config_layout.addWidget(self.can1_settings)
         config_buttons = QHBoxLayout()
         self.copy_config = QPushButton('复制命令')
         self.copy_config.clicked.connect(lambda: QApplication.clipboard().setText(
@@ -209,6 +239,9 @@ class CanPanel(QWidget):
         self.enable_fd.toggled.connect(self.update_controls)
         self.frame_type.currentIndexChanged.connect(self.update_controls)
         self.load_settings()
+        self.pad_classic_tx.toggled.connect(self.update_controls)
+        self.pad_classic_tx.toggled.connect(lambda _: self.stop_sending.emit())
+        self.interface.currentTextChanged.connect(self.update_controls)
         self.backend.currentIndexChanged.connect(self._backend_changed)
         self._apply_backend_ui()
         self.refresh_interfaces()
@@ -224,6 +257,20 @@ class CanPanel(QWidget):
     def backend_name(self):
         return self.backend.currentData() or 'socketcan'
 
+    def _dual_channel(self):
+        selection = self._connected_interface or self.interface.currentText().strip()
+        return self.backend_name() == 'controlcanfd' and selection.partition(':')[2] == '0+1'
+
+    def _target_fd_enabled(self):
+        if self._dual_channel() and self.tx_channel.currentIndex() == 1 and self.can1_settings.isChecked():
+            return self.can1_fd.isChecked()
+        return self.enable_fd.isChecked()
+
+    def _tx_channel_changed(self, *args):
+        if self.active:
+            self.stop_sending.emit()
+        self.update_controls()
+
     def _backend_changed(self, *args):
         if self.active or self.connecting or self.closing:
             # Disabled widgets can still be changed by settings/code. Keep the
@@ -235,7 +282,8 @@ class CanPanel(QWidget):
         if self._selected_backend:
             self._channels[self._selected_backend] = self.interface.currentText().strip()
         self._selected_backend = self.backend_name()
-        default = {'socketcan': 'can0', 'pcan': 'PCAN_USBBUS1', 'gs_usb': '0'}
+        default = {'socketcan': 'can0', 'pcan': 'PCAN_USBBUS1', 'gs_usb': '0',
+                   'controlcanfd': '0:0'}
         self.interface.clear()
         self.interface.setCurrentText(self._channels.get(self._selected_backend,
                                                         default[self._selected_backend]))
@@ -253,6 +301,7 @@ class CanPanel(QWidget):
             'socketcan': 'Linux SocketCAN 接口名称，例如 can0 或 vcan0。',
             'pcan': 'PEAK PCAN 通道，例如 PCAN_USBBUS1；点击刷新搜索已连接设备。',
             'gs_usb': 'candleLight 设备索引，从 0 开始；插拔后请刷新并确认设备顺序。',
+            'controlcanfd': '0:0 打开 CAN0，0:1 打开 CAN1，0:0+1 同时打开两路。冒号前是设备索引。',
         }[backend])
         if socketcan:
             self.interface_hint.setText('比特率单位 bit/s，需与总线一致。\n点击打开自动配置。')
@@ -261,7 +310,9 @@ class CanPanel(QWidget):
             self.receive_own.setToolTip('启用 SocketCAN 本 socket 回环；默认关闭，避免把 TX 回环当作设备回复。')
         else:
             self.interface_hint.setText('选择设备通道和比特率后直接打开。' +
-                ('CAN FD 需要 PCAN FD 适配器。' if backend == 'pcan' else 'candleLight 当前支持经典 CAN。'))
+                {'pcan': 'CAN FD 需要 PCAN FD 适配器。',
+                 'gs_usb': 'candleLight 当前支持经典 CAN。',
+                 'controlcanfd': '选 0:0+1 同时打开两路。'}[backend])
             self.interface_hint.setToolTip('关闭会释放本程序的驱动通道。请在“高级”查看驱动要求。')
             self.receive_own.setToolTip('显示本程序发送成功的帧回显；回显不代表设备回复或总线 ACK。')
         self.counts.setToolTip('字节数仅统计数据载荷，RTR 为 0 字节。TX 计数表示'
@@ -270,6 +321,25 @@ class CanPanel(QWidget):
             self.enable_fd.setChecked(False)
             self.brs.setChecked(False)
         self.frame_type.model().item(2).setEnabled(backend != 'gs_usb')
+        # Keep manually entered values visible so a driver can explain an
+        # unsupported setting instead of silently changing the bus bitrate.
+        for widget, rates in (
+            (self.bitrate, [str(rate) for rate in ARBITRATION_BITRATES] if backend == 'controlcanfd' else
+                           ['10000', '20000', '50000', '100000', '125000',
+                            '250000', '500000', '800000', '1000000']),
+            (self.data_bitrate, [str(rate) for rate in DATA_BITRATES] if backend == 'controlcanfd' else
+                                ['1000000', '2000000', '4000000', '5000000', '8000000']),
+        ):
+            previous = widget.currentText()
+            widget.blockSignals(True)
+            widget.clear()
+            widget.addItems(rates)
+            widget.setCurrentText(previous)
+            widget.blockSignals(False)
+        self.data_bitrate.setToolTip(
+            '单位 bit/s；创芯 SDK 支持 100k、125k、250k、500k、800k、1M、2M、4M、5M，'
+            '数据比特率不得低于仲裁比特率，不支持 8M。' if backend == 'controlcanfd' else
+            'CAN FD 数据比特率，单位 bit/s；需与总线配置一致。')
 
     def _poll_discovery(self):
         for backend, job in list(self._discovery_jobs.items()):
@@ -290,10 +360,17 @@ class CanPanel(QWidget):
             else:
                 self.interface.clear()
                 self.interface.addItems(names)
+                if backend == 'controlcanfd':
+                    self.interface.addItems([f'{name}+1' for name in names
+                                             if name.endswith(':0') and name[:-1] + '1' in names])
                 self.interface.setCurrentText(previous or (names[0] if names else
-                    'PCAN_USBBUS1' if backend == 'pcan' else '0'))
-                self.note('找到 ' + str(len(names)) + ' 个 CAN 通道' if names else
-                          '未发现 CAN 设备；请检查驱动及 USB 连接，也可手动填写通道。')
+                    'PCAN_USBBUS1' if backend == 'pcan' else
+                    '0:0' if backend == 'controlcanfd' else '0'))
+                if names and backend == 'controlcanfd':
+                    self.note('发现 ' + str(len(names)) + ' 个候选通道；请确认 SDK 设备索引。')
+                else:
+                    self.note('找到 ' + str(len(names)) + ' 个 CAN 通道' if names else
+                              '未发现 CAN 设备；请检查驱动及 USB 连接，也可手动填写通道。')
             self.update_controls()
         if not self._discovery_jobs:
             self.discovery_poll.stop()
@@ -305,6 +382,22 @@ class CanPanel(QWidget):
             self.config_hint.setText('选择通道和比特率后直接打开；设备枚举、连接和收发均在后台执行。'
                                      '关闭释放本程序的驱动通道。')
             self.copy_config.setText('复制信息')
+            if backend == 'controlcanfd':
+                self.config_commands.setPlainText(
+                    '创芯科技 CANFD（Linux）\n'
+                    '适用于 DOC/Linux资料包V1.03 的 USBCANFD-200U（设备类型 41），使用 libcontrolcanfd.so。\n'
+                    '0:0 打开 CAN0，0:1 打开 CAN1，0:0+1 同时打开第一台设备的两路通道。\n'
+                    '双通道时，左侧比特率和 FD 设置用于 CAN0。CAN1 默认沿用，也可在下方独立设置。\n'
+                    '两路同时接收，发送时在发送区选择 CAN0 或 CAN1。\n'
+                    '刷新按 USB 设备数量提供候选通道，不打开设备；多设备插拔后需确认 SDK 设备索引，必要时手动输入。\n'
+                    '点击打开后才配置并启动选定通道。\n'
+                    '本机桌面 USB 权限可用 sudo ./install.sh --canfd-permissions 配置。打开前关闭占用设备的厂商软件。\n'
+                    '本驱动使用 ISO CAN FD 模式；CAN FD 通信需勾选“启用 CAN FD”，并设置一致的仲裁/数据比特率。\n'
+                    '仲裁比特率：50k、100k、125k、250k、500k、800k、1M bit/s。\n'
+                    '数据比特率：100k、125k、250k、500k、800k、1M、2M、4M、5M bit/s，不支持 8M。\n'
+                    '按总线拓扑确认两端的终端电阻（外部 120Ω 或设备内置）；程序保留现有终端电阻设置。\n'
+                    '关闭释放本程序的设备；请确认设备索引与实际插入顺序一致。')
+                return
             self.config_commands.setPlainText(
                 'PCAN（PEAK）\n安装 PEAK 官方 PCAN 驱动及 PCAN-Basic；PCANBasic.dll 必须与程序位数一致。\n'
                 '通道示例：PCAN_USBBUS1。CAN FD 需要支持 FD 的适配器；比特率应与总线一致。'
@@ -352,6 +445,9 @@ class CanPanel(QWidget):
 
     def refresh_interfaces(self):
         backend = self.backend_name()
+        if backend == 'controlcanfd' and sys.platform != 'linux':
+            self.note('创芯科技 CANFD 仅支持 Linux')
+            return
         if backend != 'socketcan':
             if backend in self._discovery_jobs:
                 return
@@ -382,6 +478,7 @@ class CanPanel(QWidget):
     def update_controls(self, *args):
         busy = self.active or self.connecting or self.closing
         backend = self.backend_name()
+        dual = self._dual_channel()
         for widget in (self.backend, self.interface, self.refresh, self.enable_fd, self.receive_own,
                        self.error_frames, self.rx_id, self.rx_mask, self.rx_format,
                        self.bitrate):
@@ -398,21 +495,27 @@ class CanPanel(QWidget):
                                if backend == 'socketcan' else '停止收发并释放本程序的驱动通道。')
                                if self.active else '')
         self.config_button.setEnabled(not (self.connecting or self.closing))
+        self.can1_settings.setVisible(dual)
+        self.can1_settings.setEnabled(not busy)
+        self.tx_channel.setVisible(dual)
+        self.tx_channel.setEnabled(not self.connecting and not self.closing)
         self.retry_stop.setText('重试停用 ' + (self._failed_close_interface or ''))
         self.retry_stop.setVisible(bool(self._failed_close_interface) and not busy)
         self.retry_stop.setEnabled(not busy)
         kind = self.frame_type.currentIndex()
+        self.pad_classic_tx.setVisible(kind == 0)
         self.rtr_dlc_label.setVisible(kind == 1)
         self.rtr_dlc.setVisible(kind == 1)
         self.brs.setVisible(kind == 2)
-        self.brs.setEnabled(backend != 'gs_usb' and kind == 2 and (not self.active or self.enable_fd.isChecked()))
+        self.brs.setEnabled(backend != 'gs_usb' and kind == 2 and (not self.active or self._target_fd_enabled()))
         if kind == 1:
             hint = 'RTR 远程帧：发送框必须为空，请设置请求长度（0–8）。'
         elif kind == 2:
             hint = ('candleLight 不支持 CAN FD；请选择经典数据帧或 RTR。' if backend == 'gs_usb' else
                     'CAN FD：HEX 数据长度为 0–8、12、16、20、24、32、48 或 64 字节；需先启用 CAN FD。')
         else:
-            hint = '发送框填写 HEX 数据；经典 CAN 最多 8 字节，可发送空数据帧。'
+            hint = ('经典 CAN 数据发送前在末尾补 00 至 8 字节。' if self.pad_classic_tx.isChecked() else
+                    '经典 CAN 按输入长度发送，允许 0–8 字节。')
         self.payload_hint.setText(hint)
 
     def note(self, text):
@@ -442,6 +545,8 @@ class CanPanel(QWidget):
             backend = self.backend_name()
             if backend == 'socketcan' and sys.platform != 'linux':
                 raise ValueError('SocketCAN 仅支持 Linux；Windows 请选择 PCAN 或 candleLight 驱动')
+            if backend == 'controlcanfd' and sys.platform != 'linux':
+                raise ValueError('创芯科技 CANFD 仅支持 Linux；Windows 请选择 PCAN 或 candleLight 驱动')
             name = self.interface.currentText().strip()
             if not name:
                 raise ValueError('请输入 CAN 接口或设备通道')
@@ -461,6 +566,10 @@ class CanPanel(QWidget):
                 error_frames=self.error_frames.isChecked(), filter_id=filter_id,
                 filter_mask=filter_mask, filter_extended=rx_extended,
             )
+            if self._dual_channel() and self.can1_settings.isChecked():
+                can1_fd = self.can1_fd.isChecked()
+                options['can1_config'] = (int(self.can1_bitrate.currentText()),
+                    int(self.can1_data_bitrate.currentText()) if can1_fd else 2000000, can1_fd)
         except (OSError, ValueError, RuntimeError) as exc:
             self.stop_sending.emit()
             self.note('CAN 打开失败：' + str(exc))
@@ -593,7 +702,8 @@ class CanPanel(QWidget):
                 self.overflow.hide()
                 self.update_controls()
                 self.save_settings()
-                mode = '经典 CAN + CAN FD' if options['fd'] else '经典 CAN'
+                mode = 'CAN0 + CAN1' if self._dual_channel() else (
+                    '经典 CAN + CAN FD' if options['fd'] else '经典 CAN')
                 self.note(f'已打开 {name}（{mode}）')
             elif time.monotonic() - self._driver_wait_since >= self.DRIVER_WAIT_SECONDS:
                 self._stop_driver('CAN 打开超时，已取消本次打开')
@@ -764,19 +874,27 @@ class CanPanel(QWidget):
             if kind == 1 and text.strip():
                 raise ValueError('RTR 远程帧不能携带数据，请清空发送框')
             data = parse_hex_payload(text)
-            if kind == 0 and len(data) > 8:
-                raise ValueError('经典 CAN 单帧最多 8 字节，请修改发送内容')
+            if kind == 0:
+                if len(data) > 8:
+                    raise ValueError('经典 CAN 单帧最多 8 字节，请修改发送内容')
+                if self.pad_classic_tx.isChecked():
+                    data = data.ljust(8, b'\x00')
             if kind == 2:
                 if self.backend_name() == 'gs_usb':
                     raise ValueError('candleLight 当前不支持 CAN FD / BRS，请选择经典数据帧或 RTR')
-                if not self.enable_fd.isChecked():
+                if not self._target_fd_enabled():
                     raise ValueError('发送 CAN FD 帧需要关闭接口后勾选“启用 CAN FD”并重新打开')
                 if len(data) not in self.FD_LENGTHS:
                     raise ValueError('CAN FD 长度必须为 0–8、12、16、20、24、32、48 或 64 字节；请明确填写完整数据')
+            channel = None
+            if self._dual_channel():
+                device = self._connected_interface.partition(':')[0]
+                channel = f'{device}:{self.tx_channel.currentIndex()}'
             frame = CanFrame(
                 can_id, data, extended=self.tx_extended.isChecked(), remote=kind == 1,
                 fd=kind == 2, bitrate_switch=kind == 2 and self.brs.isChecked(),
                 dlc=self.rtr_dlc.value() if kind == 1 else None,
+                channel=channel,
             )
             self.bus.send(frame)
         except (ValueError, UnicodeError, BufferError) as exc:
@@ -841,12 +959,13 @@ class CanPanel(QWidget):
     def load_settings(self):
         default_backend = 'socketcan' if sys.platform == 'linux' else 'pcan'
         backend = self.settings.value('can/backend', default_backend)
-        if self.backend.findData(backend) < 0 or (backend == 'socketcan' and sys.platform != 'linux'):
+        if (self.backend.findData(backend) < 0
+                or (backend in ('socketcan', 'controlcanfd') and sys.platform != 'linux')):
             backend = default_backend
         self.backend.setCurrentIndex(self.backend.findData(backend))
         self._selected_backend = backend
         defaults = {'socketcan': self.settings.value('can/interface', ''),
-                    'pcan': 'PCAN_USBBUS1', 'gs_usb': '0'}
+                    'pcan': 'PCAN_USBBUS1', 'gs_usb': '0', 'controlcanfd': '0:0'}
         self._channels = {key: str(self.settings.value('can/channel_' + key, default))
                           for key, default in defaults.items()}
         self.interface.setCurrentText(self._channels[backend])
@@ -854,7 +973,7 @@ class CanPanel(QWidget):
             widget.setText(self.settings.value('can/' + key, widget.text()))
         for key, widget in (('enable_fd', self.enable_fd), ('receive_own', self.receive_own),
                             ('error_frames', self.error_frames), ('tx_extended', self.tx_extended),
-                            ('brs', self.brs)):
+                            ('brs', self.brs), ('pad_classic_tx', self.pad_classic_tx)):
             widget.setChecked(self.settings.value('can/' + key, widget.isChecked(), type=bool))
         for key, widget in (('rx_format', self.rx_format), ('frame_type', self.frame_type)):
             widget.setCurrentIndex(max(0, min(widget.count() - 1,
@@ -863,6 +982,12 @@ class CanPanel(QWidget):
         for key, widget in (('bitrate', self.bitrate), ('data_bitrate', self.data_bitrate)):
             value = self.settings.value('can/' + key, widget.currentText())
             widget.setCurrentText(str(value))
+        self.can1_bitrate.setCurrentText(str(self.settings.value('can/can1_bitrate', '500000')))
+        self.can1_data_bitrate.setCurrentText(str(self.settings.value('can/can1_data_bitrate', '2000000')))
+        self.can1_fd.setChecked(self.settings.value('can/can1_fd', True, type=bool))
+        self.can1_settings.setChecked(self.settings.value('can/can1_independent', False, type=bool))
+        port = self.settings.value('can/tx_channel', 0, type=int)
+        self.tx_channel.setCurrentIndex(1 if port == 1 else 0)
 
     def save_settings(self):
         backend = self.backend_name()
@@ -876,10 +1001,15 @@ class CanPanel(QWidget):
             self.settings.setValue('can/' + key, widget.text())
         for key, widget in (('enable_fd', self.enable_fd), ('receive_own', self.receive_own),
                             ('error_frames', self.error_frames), ('tx_extended', self.tx_extended),
-                            ('brs', self.brs)):
+                            ('brs', self.brs), ('pad_classic_tx', self.pad_classic_tx)):
             self.settings.setValue('can/' + key, widget.isChecked())
         for key, widget in (('rx_format', self.rx_format), ('frame_type', self.frame_type)):
             self.settings.setValue('can/' + key, widget.currentIndex())
         self.settings.setValue('can/rtr_dlc', self.rtr_dlc.value())
         for key, widget in (('bitrate', self.bitrate), ('data_bitrate', self.data_bitrate)):
             self.settings.setValue('can/' + key, widget.currentText())
+        self.settings.setValue('can/can1_bitrate', self.can1_bitrate.currentText())
+        self.settings.setValue('can/can1_data_bitrate', self.can1_data_bitrate.currentText())
+        self.settings.setValue('can/can1_fd', self.can1_fd.isChecked())
+        self.settings.setValue('can/can1_independent', self.can1_settings.isChecked())
+        self.settings.setValue('can/tx_channel', self.tx_channel.currentIndex())

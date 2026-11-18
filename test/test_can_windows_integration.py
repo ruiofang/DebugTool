@@ -197,17 +197,17 @@ class WindowsCanWindowTests(unittest.TestCase):
         window.chk_checksum.setChecked(True)
         window.send_edit.setPlainText('01 02 AA FF')
         window.btn_send.click()
-        self.assertEqual(bus.accepted, [CanFrame(0x123, bytes.fromhex('01 02 AA FF'))])
+        self.assertEqual(bus.accepted, [CanFrame(0x123, bytes.fromhex('01 02 AA FF 00 00 00 00'))])
         self.assertEqual(window.can_panel.tx_frames, 0)
         self.assertEqual(window.tx_bytes, 0)
         self.assertNotIn(' TX [CAN ', self.log_text())
         bus.confirm()
         window.can_panel.drain()
         self.assertEqual(window.can_panel.tx_frames, 1)
-        self.assertEqual(window.tx_bytes, 4)
+        self.assertEqual(window.tx_bytes, 8)
         window.can_panel.toggle.click()
         window.can_panel.drain()
-        self.assertIn(' TX [CAN pcan:PCAN_USBBUS1] ID=0x123 STD DATA LEN=4 DATA=01 02 AA FF',
+        self.assertIn(' TX [CAN pcan:PCAN_USBBUS1] ID=0x123 STD DATA LEN=8 DATA=01 02 AA FF 00 00 00 00',
                       self.log_text())
 
     def test_gs_usb_disables_fd_and_rejects_restored_fd_frame_type(self):

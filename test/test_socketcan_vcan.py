@@ -126,7 +126,8 @@ class VirtualCanTests(unittest.TestCase):
         self.assertEqual(window.can_panel.rx_bytes, 200)
         window.send_edit.setPlainText('AA 55')
         window.on_send_clicked()
-        self.assertEqual(self.receive(peer).data, b'\xaa\x55')
+        outgoing = self.receive(peer)
+        self.assertEqual((outgoing.data, outgoing.dlc), (b'\xaa\x55' + bytes(6), 8))
         window.spn_interval.setValue(20)
         window.chk_auto_send.setChecked(True)
         until = time.monotonic() + 0.15
@@ -193,7 +194,7 @@ class VirtualCanTests(unittest.TestCase):
         peer.send(CanFrame(0x124, b'\x03\x04'))
         self.wait_until(lambda: panel.rx_frames == 2)
         self.assertTrue(panel.send_text('AA 55'))
-        self.assertEqual(self.receive(peer).data, b'\xaa\x55')
+        self.assertEqual(self.receive(peer).data, b'\xaa\x55' + bytes(6))
 
         # Internal teardown is still distinct from explicitly stopping the bus.
         panel.stop()

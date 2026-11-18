@@ -78,6 +78,7 @@ class BuildVersionTests(unittest.TestCase):
         self.entry.write_text('__version__ = "V0.0.0"\n', encoding='utf-8')
         self.stack.enter_context(patch.object(build, 'HERE', self.directory))
         self.stack.enter_context(patch.object(build, 'ENTRY', self.entry))
+        self.stack.enter_context(patch.object(build, 'controlcanfd_packaging_options', return_value=[]))
         self.stack.enter_context(patch('sys.stdout', new_callable=io.StringIO))
         self.stack.enter_context(patch('sys.stderr', new_callable=io.StringIO))
         self.stdin = self.stack.enter_context(patch('sys.stdin'))

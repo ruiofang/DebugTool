@@ -128,8 +128,53 @@ def can_packaging_options(is_win):
     return options
 
 
+def controlcanfd_packaging_options():
+    """Bundle the Linux SDK for this Python process; do not load or probe USB."""
+    if sys.platform != 'linux':
+        return []
+    from controlcanfd_bus import SDK_DIRECTORY, sdk_arch
+    try:
+        arch = sdk_arch()
+    except RuntimeError as exc:
+        print(f'>>> 警告：{exc}；本次产物无法使用“创芯科技 CANFD（Linux）”。', file=sys.stderr)
+        return []
+    library = HERE / SDK_DIRECTORY / arch / 'libcontrolcanfd.so'
+    if not library.is_file():
+        raise FileNotFoundError(f'缺少创芯科技 CANFD 运行库 {library}。'
+                                '请从 Linux资料包V1.03 恢复对应架构的运行库后重新打包。')
+    return ['--add-binary', str(library) + os.pathsep + (SDK_DIRECTORY / arch).as_posix()]
+
+
+def run_pyinstaller():
+    """Run in the build subprocess, tolerating absent Linux probe candidates.
+
+    ctypes' Linux library probe can raise FileNotFoundError for a missing
+    intermediate linker candidate (for example liblibusb-1.0.a). PyInstaller's
+    USB hook expects an unavailable library to return None instead. Keep this
+    workaround scoped to the packager; application library loading is unchanged.
+    """
+    import ctypes.util
+    original_find_library = ctypes.util.find_library
+
+    def find_optional_library(name):
+        try:
+            return original_find_library(name)
+        except FileNotFoundError as exc:
+            print(f'>>> 警告：打包探测可选库 {name!r} 时未找到候选文件：{exc}', file=sys.stderr)
+            return None
+
+    if sys.platform == 'linux':
+        ctypes.util.find_library = find_optional_library
+    try:
+        import PyInstaller.__main__
+        return PyInstaller.__main__.run(sys.argv[1:])
+    finally:
+        ctypes.util.find_library = original_find_library
+
+
 def build():
     version, author = read_meta()
+    controlcanfd_options = controlcanfd_packaging_options()
     # VERSION is authoritative on every platform. Refresh this generated file
     # before packaging so a stale Windows resource never looks like a second
     # version source when developing or building on Linux.
@@ -142,13 +187,15 @@ def build():
     ensure_icon()
     is_win = sys.platform.startswith("win")
     can_options = can_packaging_options(is_win)
+    can_options += controlcanfd_options
 
     # Output name, bundled version and Windows resources use the same value.
     plat_suffix = "" if is_win else f"-{sys.platform}"
     name = f"{APP_NAME}-{version}{plat_suffix}"
 
-    cmd = [
-        sys.executable, "-m", "PyInstaller",
+    runner = ([sys.executable, '-c', 'from build import run_pyinstaller; run_pyinstaller()']
+              if sys.platform == 'linux' else [sys.executable, '-m', 'PyInstaller'])
+    cmd = runner + [
         "--onefile",
         "--noconsole" if is_win else "--windowed",
         "--name", name,
@@ -220,7 +267,11 @@ def main(argv=None):
 
     if args.set_version is not None:
         return 0
-    build()
+    try:
+        build()
+    except FileNotFoundError as exc:
+        print(f'✘ 打包失败。{exc}', file=sys.stderr)
+        return 1
     return 0
 
 

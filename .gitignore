@@ -10,3 +10,5 @@ serial_tool.ini
 /.venv/
 /tests/
 ssh_known_hosts
+DOC/t113/
+DOC/Linux资料包V1.03/

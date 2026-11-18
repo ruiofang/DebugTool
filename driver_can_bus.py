@@ -1,4 +1,4 @@
-"""Queued PCAN / candleLight transports; driver calls never run on the UI thread.
+"""Queued USB CAN transports; driver calls never run on the UI thread.
 
 python-can is imported lazily, so Linux SocketCAN does not need USB libraries.
 One worker owns a driver from initialization through shutdown. A successful send
@@ -29,6 +29,8 @@ def _load_can():
 
 def _driver_error(backend, exc):
     detail = str(exc) or type(exc).__name__
+    if backend == "controlcanfd":
+        return f"创芯科技 CANFD（Linux）：{detail}"
     if isinstance(exc, ImportError):
         return f"CAN 依赖缺失：{detail}；请安装 requirements.txt 后重新打包"
     if backend == "pcan":
@@ -54,6 +56,9 @@ def discover_channels(backend):
     candleLight indices are zero based and can change after unplug/replug.
     """
     try:
+        if backend == "controlcanfd":
+            from controlcanfd_bus import discover_channels as discover_controlcanfd
+            return discover_controlcanfd()
         if backend == "pcan":
             can = _load_can()
             # The stock detector suppresses DLL loading errors. Probe explicitly
@@ -226,16 +231,23 @@ class DriverCanBus:
 
     def __init__(self, backend, channel, bitrate, fd=False, data_bitrate=2000000,
                  receive_own=False, error_frames=True, filter_id=0, filter_mask=0,
-                 filter_extended=None):
-        if backend not in ("pcan", "gs_usb"):
-            raise ValueError("CAN 后端须为 pcan 或 gs_usb")
+                 filter_extended=None, can1_config=None):
+        if backend not in ("pcan", "gs_usb", "controlcanfd"):
+            raise ValueError("CAN 后端须为 pcan、gs_usb 或 controlcanfd")
         if not isinstance(channel, str):
             raise ValueError("请选择 CAN 通道")
         channel = channel.strip()
+        self._native_ports = None
+        self._can1_config = can1_config
         if backend == "pcan":
             channel = channel.upper()
             if not re.fullmatch(r"PCAN_[A-Z]+BUS[1-9][0-9]?", channel):
                 raise ValueError("PCAN 通道格式示例：PCAN_USBBUS1")
+        elif backend == "controlcanfd":
+            if sys.platform != "linux":
+                raise ValueError("创芯科技 CANFD 驱动仅支持 Linux")
+            from controlcanfd_bus import channel_configs
+            _, self._native_ports = channel_configs(channel, bitrate, data_bitrate, fd, can1_config)
         elif not re.fullmatch(r"[0-9]{1,3}", channel):
             raise ValueError("candleLight 通道为从 0 开始的设备序号，例如 0")
         else:
@@ -266,9 +278,12 @@ class DriverCanBus:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._work_ready = threading.Event()
-        self._key = (backend, channel)
+        # One worker owns the SDK device, even when it runs both channels.
+        self._key = (backend, channel.split(':')[0] if backend == "controlcanfd" else channel)
         with _CHANNEL_LOCK:
             if self._key in _CHANNEL_OWNERS:
+                if backend == "controlcanfd":
+                    raise RuntimeError("该创芯设备已占用。请关闭连接后选择双通道，再打开一次")
                 raise RuntimeError("该 CAN 通道仍在打开或关闭，请等待驱动释放后重试")
             _CHANNEL_OWNERS.add(self._key)
         self._thread = threading.Thread(target=self._run, name=f"CAN-{backend}-{channel}", daemon=True)
@@ -284,6 +299,11 @@ class DriverCanBus:
         return self.state == "open"
 
     def _open(self, can):
+        if self.backend == "controlcanfd":
+            from controlcanfd_bus import ControlCanFdDriver
+            return ControlCanFdDriver(self.channel, self.bitrate, fd=self.fd,
+                                      data_bitrate=self.data_bitrate, receive_own=self.receive_own,
+                                      can1_config=self._can1_config)
         # Do not inherit python-can's user config: the panel is authoritative.
         options = dict(channel=self.channel, bitrate=self.bitrate,
                        can_filters=None)
@@ -297,7 +317,14 @@ class DriverCanBus:
 
     def send(self, frame):
         encode_frame(frame)  # reuse the strict TX ID / length / RTR / FD validator
-        if frame.fd and not self.fd:
+        if self._native_ports is not None:
+            from controlcanfd_bus import transmit_channel
+            channel = transmit_channel(frame.channel, self._native_ports)
+            if frame.fd and not self._native_ports[channel][2]:
+                raise ValueError(f"通道 {channel} 未启用 CAN FD")
+            if frame.channel is None:
+                frame = replace(frame, channel=channel)
+        elif frame.fd and not self.fd:
             raise ValueError("请先启用 CAN FD 后再发送 FD 帧")
         with self._lock:
             if self.state != "open" or self._stop.is_set():
@@ -328,6 +355,11 @@ class DriverCanBus:
                 self.state = "closing"
 
     def _accept(self, msg):
+        if self.backend == "controlcanfd":
+            if msg.error:
+                return self.error_frames
+            return ((self.filter_extended is None or msg.extended == self.filter_extended)
+                    and (msg.can_id & self.filter_mask) == (self.filter_id & self.filter_mask))
         if not self.receive_own and not msg.is_rx:
             return False
         if msg.is_error_frame:
@@ -336,6 +368,8 @@ class DriverCanBus:
                 and (msg.arbitration_id & self.filter_mask) == (self.filter_id & self.filter_mask))
 
     def _frame(self, msg):
+        if self.backend == "controlcanfd":
+            return msg
         return CanFrame(
             can_id=msg.arbitration_id, data=b"" if msg.is_remote_frame else bytes(msg.data),
             dlc=msg.dlc, extended=msg.is_extended_id, remote=msg.is_remote_frame,
@@ -344,6 +378,8 @@ class DriverCanBus:
             error=msg.is_error_frame, timestamp=msg.timestamp)
 
     def _message(self, can, frame):
+        if self.backend == "controlcanfd":
+            return frame
         msg = can.Message(arbitration_id=frame.can_id, data=frame.data,
                           is_extended_id=frame.extended, is_remote_frame=frame.remote,
                           is_fd=frame.fd, bitrate_switch=frame.bitrate_switch,
@@ -355,12 +391,19 @@ class DriverCanBus:
             msg.data.extend(bytes(msg.dlc))
         return msg
 
+    def _queue_received(self, frame):
+        with self._lock:
+            if len(self._rx) >= self.MAX_RX_FRAMES:
+                self._rx.popleft()
+                self.rx_dropped += 1
+            self._rx.append(frame)
+
     def _run(self):
         driver = None
         try:
             if self._stop.is_set():
                 return
-            can = _load_can()
+            can = None if self.backend == "controlcanfd" else _load_can()
             if self._stop.is_set():
                 return
             driver = self._open(can)
@@ -378,14 +421,18 @@ class DriverCanBus:
                         frame = self._tx.popleft()
                         self._inflight = 1
                     driver.send(self._message(can, frame), timeout=self.SEND_TIMEOUT)
+                    confirmed = replace(frame, timestamp=time.time())
                     with self._lock:
-                        self._sent.append(replace(frame, timestamp=time.time()))
+                        self._sent.append(confirmed)
                         self._inflight = 0
+                    if self.backend == "controlcanfd" and self.receive_own and self._accept(confirmed):
+                        self._queue_received(confirmed)
                 if self._stop.is_set():
                     break
-                if self.backend == "pcan" and time.monotonic() >= next_status:
+                if self.backend in ("pcan", "controlcanfd") and time.monotonic() >= next_status:
                     status = driver.status()
-                    if status & 0x10:  # PCAN_ERROR_BUSOFF, not SocketCAN CAN_ERR_BUSOFF.
+                    if self.backend == "pcan" and status & 0x10:
+                        # PCAN_ERROR_BUSOFF, not SocketCAN CAN_ERR_BUSOFF.
                         raise RuntimeError("PCAN 总线 BUS-OFF，请检查比特率、接线和终端电阻后重新打开")
                     next_status = time.monotonic() + 0.25
                 receive_started = time.monotonic()
@@ -405,12 +452,7 @@ class DriverCanBus:
                         if not pending:
                             self._work_ready.wait(remaining)
                 if msg is not None and self._accept(msg):
-                    frame = self._frame(msg)
-                    with self._lock:
-                        if len(self._rx) >= self.MAX_RX_FRAMES:
-                            self._rx.popleft()
-                            self.rx_dropped += 1
-                        self._rx.append(frame)
+                    self._queue_received(self._frame(msg))
         except Exception as exc:
             with self._lock:
                 self.error = _driver_error(self.backend, exc)

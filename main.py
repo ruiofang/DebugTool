@@ -1990,8 +1990,8 @@ class DebugTool(QMainWindow):
                        self.chk_rx_hex):
             widget.setEnabled(not is_can)
         self.send_edit.setPlaceholderText(
-            "单帧 CAN 数据（HEX）：01 02 AA FF；留空可发送零字节数据帧。\n"
-            "经典 CAN 最多 8 字节；CAN FD 最多 64 字节；远程帧请清空数据并设置 DLC。"
+            "单帧 CAN 数据（HEX），例如 01 02 AA FF。\n"
+            "经典 CAN 最多 8 字节，CAN FD 最多 64 字节。远程帧请清空数据并设置 DLC。"
             if is_can else self._default_send_placeholder)
         self.btn_send.setText("发送 CAN 帧" if is_can else "发  送")
         self.chk_auto_reply.setEnabled(index == 0)
@@ -2087,7 +2087,8 @@ class DebugTool(QMainWindow):
         for frame in frames:
             timestamp = (datetime.datetime.fromtimestamp(frame.timestamp)
                          if frame.timestamp is not None else datetime.datetime.now())
-            details = f'[CAN {channel}] {self._can_frame_text(frame)}'
+            source = f'{backend}:{frame.channel}' if frame.channel is not None else channel
+            details = f'[CAN {source}] {self._can_frame_text(frame)}'
             shown.append(f'{self._display_prefix(direction, timestamp)}{details}')
             records.append(f'{timestamp.isoformat(timespec="milliseconds")} {direction} {details}\n')
         if shown:
